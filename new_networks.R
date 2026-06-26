@@ -17,6 +17,27 @@ setNames(
   basename(files)
 )
 
+#stage 0: fixing the dates in some of the datasets bc the years were scuffed (likely bc excel)
+library(stringr)
+library(lubridate)
+
+#hopefully the collection code is more accurate 
+amphib_dissect <- amphib_dissect %>%
+  mutate(
+    collect_date = str_extract(collect_code, "\\d{8}"),
+    collect_date = ymd(collect_date),
+    year = year(collect_date)
+  )
+
+amphib_parasite <- amphib_parasite %>%
+  mutate(
+    date = str_extract(collect_code, "\\d{8}"),
+    date = ymd(date),
+    year = year(date)
+  )
+
+
+
 #stage 1: read + standardize data
 
 amphib_dissect <- read_csv("amphib_dissect.csv") %>%
@@ -140,6 +161,129 @@ wetland_info %>%
     min_year = min(year, na.rm = TRUE),
     max_year = max(year, na.rm = TRUE)
   )
+
+
+#stage 2: construct master host–parasite interaction table
+
+#cleaning disssection data
+
+dissect_clean <- amphib_dissect %>%
+  select(
+    dissect_code,
+    site_code,
+    spp_code,
+    collect_date,
+    year,
+    parasites
+  ) %>%
+  filter(
+    !is.na(dissect_code),
+    !is.na(site_code),
+    !is.na(spp_code),
+    !is.na(year)
+  )
+
+#cleaning parasite
+parasite_clean <- amphib_parasite %>%
+  select(
+    dissect_code,
+    parasite_name,
+    parasite_cnt,
+    presence
+  ) %>%
+  mutate(
+    parasite_name = str_trim(parasite_name)
+  ) %>%
+  filter(
+    !is.na(dissect_code),
+    !is.na(parasite_name),
+    parasite_name != ""
+  )
+
+#joining parasite obs to host metadata
+hp_raw <- parasite_clean %>%
+  left_join(
+    dissect_clean,
+    by = "dissect_code"
+  )
+
+hp_raw <- hp_raw %>% #removing incomplete obs
+  filter(
+    !is.na(site_code),
+    !is.na(spp_code),
+    !is.na(year)
+  )
+
+#convert to binary presence
+hp_binary <- hp_raw %>%
+mutate(
+  interaction = case_when(
+    !is.na(parasite_cnt) & parasite_cnt > 0 ~ 1L,
+    presence %in% c(TRUE, "Y", "Yes", 1) ~ 1L,
+    TRUE ~ 0L
+  )
+)
+
+
+#collapse to unique interactions (same host with the same site/year are collapsed into one)
+hp_edges <- hp_binary %>%
+  group_by(
+    site_code,
+    year,
+    spp_code,
+    parasite_name
+  ) %>%
+  summarize(
+    interaction = max(interaction),
+    n_hosts_examined = n_distinct(dissect_code),
+    total_parasites = sum(parasite_cnt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(interaction == 1)
+
+
+#inc. pond longevity
+hp_edges <- hp_edges %>%
+  left_join(
+    site_info %>%
+      select(site_code, longevity),
+    by = "site_code"
+  )
+
+#sanity checking
+cat("\nUnique interactions:", nrow(hp_edges), "\n")
+
+cat("\nHost species:", n_distinct(hp_edges$spp_code), "\n")
+
+cat("Parasite taxa:", n_distinct(hp_edges$parasite_name), "\n")
+
+cat("Sites:", n_distinct(hp_edges$site_code), "\n")
+
+cat("Years:", n_distinct(hp_edges$year), "\n")#thank god they're all reasonable
+
+# interactions per year
+hp_edges %>%
+  count(year)
+
+# interactions by longevity class
+hp_edges %>%
+  count(longevity)
+
+# host richness by site
+hp_edges %>%
+  distinct(site_code, spp_code) %>%
+  count(site_code, name = "host_richness")
+
+# parasite richness by site
+hp_edges %>%
+  distinct(site_code, parasite_name) %>%
+  count(site_code, name = "parasite_richness")
+
+
+
+
+
+
 
 
 
