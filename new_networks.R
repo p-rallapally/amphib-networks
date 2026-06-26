@@ -681,6 +681,175 @@ network_grid
 #)
 
 
+#stage 5: node level metrics
+
+#function for node centality per graph
+summarize_hp_nodes <- function(g, subset_type, subset_value) {
+  
+  tibble(
+    subset_type = subset_type,
+    subset_value = subset_value,
+    node = V(g)$name,
+    node_type = V(g)$node_type,
+    label = str_remove(V(g)$name, "^host_|^parasite_"),
+    degree = degree(g),
+    betweenness = betweenness(g, normalized = TRUE),
+    closeness = closeness(g, normalized = TRUE),
+    eigen = eigen_centrality(g)$vector
+  )
+}
+
+#pooled node centrality
+g_meta <- build_hp_graph(hp_edges)
+
+meta_node_summary <- summarize_hp_nodes(
+  g = g_meta,
+  subset_type = "pooled",
+  subset_value = "all_years"
+)
+
+meta_node_summary %>%
+  arrange(desc(eigen))
+
+#year-specific node centrality
+yearly_node_summary <- hp_edges %>%
+  group_split(year) %>%
+  map_dfr(function(df_year) {
+    
+    yr <- unique(df_year$year)
+    
+    g_year <- build_hp_graph(df_year)
+    
+    summarize_hp_nodes(
+      g = g_year,
+      subset_type = "year",
+      subset_value = as.character(yr)
+    )
+  })
+
+yearly_node_summary
+
+#longevity-specific node centrality
+longevity_node_summary <- hp_edges %>%
+  filter(!is.na(longevity), longevity != "") %>%
+  group_split(longevity) %>%
+  map_dfr(function(df_longevity) {
+    
+    lon <- unique(df_longevity$longevity)
+    
+    g_lon <- build_hp_graph(df_longevity)
+    
+    summarize_hp_nodes(
+      g = g_lon,
+      subset_type = "longevity",
+      subset_value = as.character(lon)
+    )
+  })
+
+longevity_node_summary
+
+#combined node summaries
+node_summary <- bind_rows(
+  meta_node_summary,
+  yearly_node_summary,
+  longevity_node_summary
+)
+
+node_summary
+
+
+#most central hosts + parasites
+top_hosts <- meta_node_summary %>%
+  filter(node_type == "Host") %>%
+  arrange(desc(degree))
+
+top_hosts
+
+top_parasites <- meta_node_summary %>%
+  filter(node_type == "Parasite") %>%
+  arrange(desc(degree))
+
+top_parasites
+
+#plots
+
+#top hosts by parasite richness/degree
+top_hosts %>%
+  ggplot(aes(x = reorder(label, degree), y = degree)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "Host species",
+    y = "Degree",
+    title = "Host parasite richness in pooled metaweb"
+  ) +
+  theme_minimal()
+
+
+#top parasites by centrality/degree
+top_parasites %>%
+  ggplot(aes(x = reorder(label, degree), y = degree)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "Parasite taxon",
+    y = "Degree",
+    title = "Parasite host breadth in pooled metaweb"
+  ) +
+  theme_minimal()
+
+
+#host centrality thru time 
+yearly_node_summary %>%
+  filter(node_type == "Host") %>%
+  mutate(year = as.integer(subset_value)) %>%
+  ggplot(aes(x = year,
+             y = degree,
+             group = label,
+             color = label)) +
+  geom_line(alpha = 0.8, linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    x = "Year",
+    y = "Degree",
+    color = "Host species",
+    title = "Host parasite richness through time"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right"
+  )
+
+
+#same thing for parasites 
+
+#(too many species for colors; find a better way to viz this)
+yearly_node_summary %>%
+  filter(node_type == "Parasite") %>%
+  mutate(year = as.integer(subset_value)) %>%
+  ggplot(aes(x = year,
+             y = degree,
+             group = label,
+             color = label)) +
+  geom_line(alpha = 0.8, linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    x = "Year",
+    y = "Degree",
+    color = "Parasite",
+    title = "Parasite host breadth through time"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 8)
+  )
+
+
+
+
+
+
 
 
 
