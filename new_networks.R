@@ -427,6 +427,261 @@ parasite_breadth %>%
   arrange(desc(host_breadth))
 
 
+#stage 4: network-level metrics for subsets
+
+#function to build graph from edge table
+build_hp_graph <- function(edge_df) {
+  
+  edges <- edge_df %>%
+    distinct(spp_code, parasite_name) %>%
+    mutate(
+      from = paste0("host_", spp_code),
+      to   = paste0("parasite_", parasite_name),
+      weight = 1
+    ) %>%
+    select(from, to, weight)
+  
+  nodes <- tibble(
+    name = unique(c(edges$from, edges$to))
+  ) %>%
+    mutate(
+      node_type = case_when(
+        str_detect(name, "^host_") ~ "Host",
+        str_detect(name, "^parasite_") ~ "Parasite",
+        TRUE ~ NA_character_
+      ),
+      bipartite_type = node_type == "Host"
+    )
+  
+  graph_from_data_frame(
+    d = edges,
+    vertices = nodes,
+    directed = FALSE
+  )
+}
+
+#function that calculates network-level metrics + summarizes graph
+summarize_hp_graph <- function(g, subset_type, subset_value) {
+  
+  node_tbl <- tibble(
+    node = V(g)$name,
+    node_type = V(g)$node_type
+  )
+  
+  n_hosts <- node_tbl %>%
+    filter(node_type == "Host") %>%
+    nrow()
+  
+  n_parasites <- node_tbl %>%
+    filter(node_type == "Parasite") %>%
+    nrow()
+  
+  n_edges <- ecount(g)
+  
+  possible_edges <- n_hosts * n_parasites
+  
+  connectance <- ifelse(
+    possible_edges > 0,
+    n_edges / possible_edges,
+    NA_real_
+  )
+  
+  comps <- components(g)
+  
+  giant_component_size <- max(comps$csize)
+  
+  giant_component_fraction <- giant_component_size / vcount(g)
+  
+  modularity_value <- ifelse(
+    ecount(g) > 0 && vcount(g) > 2,
+    modularity(cluster_louvain(g)),
+    NA_real_
+  )
+  
+  tibble(
+    subset_type = subset_type,
+    subset_value = subset_value,
+    n_hosts = n_hosts,
+    n_parasites = n_parasites,
+    n_nodes = vcount(g),
+    n_edges = n_edges,
+    connectance = connectance,
+    mean_degree = mean(degree(g)),
+    modularity = modularity_value,
+    n_components = comps$no,
+    giant_component_size = giant_component_size,
+    giant_component_fraction = giant_component_fraction
+  )
+}
+
+#pooled metaweb summary
+g_meta <- build_hp_graph(hp_edges)
+
+summary_meta <- summarize_hp_graph(
+  g = g_meta,
+  subset_type = "pooled",
+  subset_value = "all_years"
+)
+
+summary_meta
+
+
+#year-specific summaries 
+yearly_network_summary <- hp_edges %>%
+  group_split(year) %>%
+  map_dfr(function(df_year) {
+    
+    yr <- unique(df_year$year)
+    
+    g_year <- build_hp_graph(df_year)
+    
+    summarize_hp_graph(
+      g = g_year,
+      subset_type = "year",
+      subset_value = as.character(yr)
+    )
+  })
+
+yearly_network_summary
+
+
+#focusing on longevity
+longevity_network_summary <- hp_edges %>%
+  filter(!is.na(longevity), longevity != "") %>%
+  group_split(longevity) %>%
+  map_dfr(function(df_longevity) {
+    
+    lon <- unique(df_longevity$longevity)
+    
+    g_lon <- build_hp_graph(df_longevity)
+    
+    summarize_hp_graph(
+      g = g_lon,
+      subset_type = "longevity",
+      subset_value = as.character(lon)
+    )
+  })
+
+longevity_network_summary
+
+#combining summaries
+network_summary <- bind_rows(
+  summary_meta,
+  yearly_network_summary,
+  longevity_network_summary
+)
+
+network_summary
+
+#plots
+
+library(patchwork)
+
+# A: network size through time
+p1 <- yearly_network_summary %>%
+  mutate(year = as.integer(subset_value)) %>%
+  ggplot(aes(x = year, y = n_edges)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Year",
+    y = "Number of interactions",
+    title = "A. Network size through time"
+  ) +
+  theme_minimal()
+
+# B: connectance through time
+p2 <- yearly_network_summary %>%
+  mutate(year = as.integer(subset_value)) %>%
+  ggplot(aes(x = year, y = connectance)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Year",
+    y = "Connectance",
+    title = "B. Connectance through time"
+  ) +
+  theme_minimal()
+
+# C: modularity through time
+p3 <- yearly_network_summary %>%
+  mutate(year = as.integer(subset_value)) %>%
+  ggplot(aes(x = year, y = modularity)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Year",
+    y = "Louvain modularity",
+    title = "C. Modularity through time"
+  ) +
+  theme_minimal()
+
+# D: comparing by longevity
+p4 <- longevity_network_summary %>%
+  pivot_longer(
+    cols = c(n_hosts, n_parasites, n_edges, connectance, modularity),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = subset_value, y = value)) +
+  geom_col() +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(
+    x = "Pond longevity",
+    y = NULL,
+    title = "D. Network structure by pond longevity"
+  ) +
+  theme_minimal()
+
+# 2x2 grid
+network_grid <- (p1 + p2) / (p3 + p4)
+
+network_grid
+
+#C: mod through time
+yearly_network_summary %>%
+  mutate(year = as.integer(subset_value)) %>%
+  ggplot(aes(x = year, y = modularity)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Year",
+    y = "Louvain modularity",
+    title = "Host-parasite modularity through time"
+  ) +
+  theme_minimal()
+
+#D: comparing by longevity
+longevity_network_summary %>%
+  pivot_longer(
+    cols = c(n_hosts, n_parasites, n_edges, connectance, modularity),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = subset_value, y = value)) +
+  geom_col() +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(
+    x = "Pond longevity",
+    y = NULL,
+    title = "Network structure by pond longevity"
+  ) +
+  theme_minimal()
+
+network_grid <- (p1 + p2) / (p3 + p4)
+
+network_grid
+
+#ggsave(
+#  filename = "network_summary_2x2.png",
+#  plot = network_grid,
+#  width = 12,
+#  height = 9,
+#  dpi = 300
+#)
+
+
+
 
 
 
