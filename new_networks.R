@@ -7,6 +7,11 @@ library(lubridate)
 library(vegan)
 library(knitr)
 library(dplyr)
+library(igraph)
+library(ggraph)
+library(stringr)
+library(lubridate)
+
 
 #lists column names so I know what to join by
 
@@ -18,8 +23,6 @@ setNames(
 )
 
 #stage 0: fixing the dates in some of the datasets bc the years were scuffed (likely bc excel)
-library(stringr)
-library(lubridate)
 
 #hopefully the collection code is more accurate 
 amphib_dissect <- amphib_dissect %>%
@@ -280,11 +283,148 @@ hp_edges %>%
   count(site_code, name = "parasite_richness")
 
 
+#stage 3: build metaweb
+
+#creating binary edge list
+meta_edges <- hp_edges %>%
+  distinct(
+    spp_code,
+    parasite_name
+  ) %>%
+  mutate(
+    from = paste0("host_", spp_code),
+    to   = paste0("parasite_", parasite_name),
+    weight = 1
+  )
+
+#creating node table
+host_nodes <- meta_edges %>%
+  distinct(from) %>%
+  transmute(
+    name = from,
+    type = "Host",
+    label = str_remove(from, "^host_")
+  )
+
+parasite_nodes <- meta_edges %>%
+  distinct(to) %>%
+  transmute(
+    name = to,
+    type = "Parasite",
+    label = str_remove(to, "^parasite_")
+  )
+
+nodes <- bind_rows(
+  host_nodes,
+  parasite_nodes
+)
+
+#building graph + diagnostics
+g_meta <- graph_from_data_frame(
+  d = meta_edges %>%
+    select(from, to, weight),
+  vertices = nodes,
+  directed = FALSE
+)
+
+cat("Nodes:", vcount(g_meta), "\n")
+cat("Edges:", ecount(g_meta), "\n\n")
+
+table(V(g_meta)$type)
+
+is_bipartite(g_meta)
+
+components(g_meta)$no
 
 
+#degree dist
+node_degree <- tibble(
+  node = V(g_meta)$name,
+  type = V(g_meta)$type,
+  degree = degree(g_meta)
+)
+
+host_degree <- node_degree %>%
+  filter(type == "Host") %>%
+  arrange(desc(degree))
+
+parasite_degree <- node_degree %>%
+  filter(type == "Parasite") %>%
+  arrange(desc(degree))
+
+host_degree
+
+parasite_degree
 
 
+#viz 
+set.seed(6262026)
 
+V(g_meta)$bipartite_type <- V(g_meta)$type == "Host"
+
+table(V(g_meta)$type, V(g_meta)$bipartite_type)
+
+ggraph(g_meta, layout = "bipartite", types = V(g_meta)$bipartite_type) +
+  
+  geom_edge_link(
+    alpha = 0.4
+  ) +
+  
+  geom_node_point(
+    aes(color = type),
+    size = 4
+  ) +
+  
+  theme_void() +
+  
+  labs(
+    title = "Binary Host–Parasite Metaweb"
+  )
+
+#centrality
+meta_centrality <- tibble(
+  node = V(g_meta)$name,
+  type = V(g_meta)$type,
+  degree = degree(g_meta),
+  betweenness = betweenness(
+    g_meta,
+    normalized = TRUE
+  ),
+  eigen = eigen_centrality(g_meta)$vector
+)
+
+meta_centrality %>%
+  arrange(desc(eigen))
+
+
+#host richness
+host_richness <- hp_edges %>%
+  distinct(
+    spp_code,
+    parasite_name
+  ) %>%
+  count(
+    spp_code,
+    name = "parasite_richness"
+  ) 
+
+host_richness %>%
+  arrange(desc(parasite_richness))
+
+
+#parasite host breadth
+parasite_breadth <- hp_edges %>%
+  distinct(
+    spp_code,
+    parasite_name
+  ) %>%
+  count(
+    parasite_name,
+    name = "host_breadth"
+  ) 
+
+parasite_breadth %>%
+  arrange(desc(host_breadth))
 
 
 
