@@ -22,23 +22,6 @@ setNames(
   basename(files)
 )
 
-#stage 0: fixing the dates in some of the datasets bc the years were scuffed (likely bc excel)
-
-#hopefully the collection code is more accurate 
-amphib_dissect <- amphib_dissect %>%
-  mutate(
-    collect_date = str_extract(collect_code, "\\d{8}"),
-    collect_date = ymd(collect_date),
-    year = year(collect_date)
-  )
-
-amphib_parasite <- amphib_parasite %>%
-  mutate(
-    date = str_extract(collect_code, "\\d{8}"),
-    date = ymd(date),
-    year = year(date)
-  )
-
 
 
 #stage 1: read + standardize data
@@ -75,6 +58,23 @@ visual_spp <- read_csv("visual_spp.csv") %>%
 
 wetland_info <- read_csv("wetland_infor.csv") %>%
   clean_names()
+
+#stage 0: fixing the dates in some of the datasets bc the years were scuffed (likely bc excel)
+
+#hopefully the collection code is more accurate 
+amphib_dissect <- amphib_dissect %>%
+  mutate(
+    collect_date = str_extract(collect_code, "\\d{8}"),
+    collect_date = ymd(collect_date),
+    year = year(collect_date)
+  )
+
+amphib_parasite <- amphib_parasite %>%
+  mutate(
+    date = str_extract(collect_code, "\\d{8}"),
+    date = ymd(date),
+    year = year(date)
+  )
 
 #structure check
 
@@ -686,12 +686,29 @@ network_grid
 #function for node centality per graph
 summarize_hp_nodes <- function(g, subset_type, subset_value) {
   
+  node_name <- V(g)$name
+  
+  label <- str_remove(node_name, "^host_|^parasite_")
+  
+  node_type <- V(g)$node_type
+  
   tibble(
     subset_type = subset_type,
     subset_value = subset_value,
-    node = V(g)$name,
-    node_type = V(g)$node_type,
-    label = str_remove(V(g)$name, "^host_|^parasite_"),
+    node = node_name,
+    node_type = node_type,
+    label = label,
+    spp_code = if_else(
+      node_type == "Host",
+      label,
+      NA_character_
+    ),
+    
+    parasite_name = if_else(
+      node_type == "Parasite",
+      label,
+      NA_character_
+    ),
     degree = degree(g),
     betweenness = betweenness(g, normalized = TRUE),
     closeness = closeness(g, normalized = TRUE),
@@ -703,9 +720,9 @@ summarize_hp_nodes <- function(g, subset_type, subset_value) {
 g_meta <- build_hp_graph(hp_edges)
 
 meta_node_summary <- summarize_hp_nodes(
-  g = g_meta,
-  subset_type = "pooled",
-  subset_value = "all_years"
+  g_meta,
+  "pooled",
+  "all_years"
 )
 
 meta_node_summary %>%
@@ -823,36 +840,545 @@ yearly_node_summary %>%
 
 #same thing for parasites 
 
-#(too many species for colors; find a better way to viz this)
-yearly_node_summary %>%
+top_n_parasites <- 8
+
+top_parasite_labels <- yearly_node_summary %>%
   filter(node_type == "Parasite") %>%
-  mutate(year = as.integer(subset_value)) %>%
-  ggplot(aes(x = year,
-             y = degree,
-             group = label,
-             color = label)) +
-  geom_line(alpha = 0.8, linewidth = 1) +
-  geom_point(size = 2) +
+  group_by(label) %>%
+  summarize(
+    mean_degree = mean(degree, na.rm = TRUE),
+    max_degree = max(degree, na.rm = TRUE),
+    n_years_observed = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_degree), desc(max_degree)) %>%
+  slice_head(n = top_n_parasites) %>%
+  pull(label)
+
+parasite_plot_df <- yearly_node_summary %>%
+  filter(node_type == "Parasite") %>%
+  mutate(
+    year = as.integer(subset_value),
+    highlight = if_else(label %in% top_parasite_labels, label, "Other parasites"),
+    is_highlight = label %in% top_parasite_labels
+  )
+
+parasite_plot <- ggplot() +
+  
+  # Background lines: all non-top parasites
+  geom_line(
+    data = parasite_plot_df %>% filter(!is_highlight),
+    aes(
+      x = year,
+      y = degree,
+      group = label
+    ),
+    color = "gray75",
+    alpha = 0.5,
+    linewidth = 0.5
+  ) +
+  
+  geom_point(
+    data = parasite_plot_df %>% filter(!is_highlight),
+    aes(
+      x = year,
+      y = degree,
+      group = label
+    ),
+    color = "gray75",
+    alpha = 0.5,
+    size = 1
+  ) +
+  
+  # Highlighted lines: top parasites
+  geom_line(
+    data = parasite_plot_df %>% filter(is_highlight),
+    aes(
+      x = year,
+      y = degree,
+      group = label,
+      color = label
+    ),
+    linewidth = 1.1
+  ) +
+  
+  geom_point(
+    data = parasite_plot_df %>% filter(is_highlight),
+    aes(
+      x = year,
+      y = degree,
+      color = label
+    ),
+    size = 2
+  ) +
+  
   labs(
     x = "Year",
     y = "Degree",
-    color = "Parasite",
-    title = "Parasite host breadth through time"
+    color = "Top parasites",
+    title = "Parasite host breadth through time",
+    subtitle = paste0(
+      "Top ", top_n_parasites,
+      " parasites by average yearly degree highlighted; all others shown in gray"
+    )
   ) +
+  
   theme_minimal() +
+  
   theme(
     legend.position = "right",
-    legend.text = element_text(size = 8)
+    legend.text = element_text(size = 8),
+    plot.title = element_text(face = "bold")
+  )
+
+parasite_plot
+
+#stage 5.5: subnetwork builder
+
+#filtering hp_edges
+filter_hp_edges <- function(data,
+                            years = NULL,
+                            longevity_classes = NULL,
+                            sites = NULL,
+                            hosts = NULL,
+                            parasites = NULL) {
+  
+  out <- data
+  
+  if (!is.null(years)) {
+    out <- out %>% filter(year %in% years)
+  }
+  
+  if (!is.null(longevity_classes)) {
+    out <- out %>% filter(longevity %in% longevity_classes)
+  }
+  
+  if (!is.null(sites)) {
+    out <- out %>% filter(site_code %in% sites)
+  }
+  
+  if (!is.null(hosts)) {
+    out <- out %>% filter(spp_code %in% hosts)
+  }
+  
+  if (!is.null(parasites)) {
+    out <- out %>% filter(parasite_name %in% parasites)
+  }
+  
+  out
+}
+
+
+#build edge list + graph from any filtered hp_edges table
+make_hp_network <- function(data,
+                            subset_type = "custom",
+                            subset_value = "custom") {
+  
+  edge_df <- data %>%
+    distinct(spp_code, parasite_name) %>%
+    filter(
+      !is.na(spp_code),
+      !is.na(parasite_name),
+      spp_code != "",
+      parasite_name != ""
+    ) %>%
+    mutate(
+      from = paste0("host_", spp_code),
+      to = paste0("parasite_", parasite_name),
+      weight = 1
+    ) %>%
+    select(from, to, weight)
+  
+  node_df <- tibble(
+    name = unique(c(edge_df$from, edge_df$to))
+  ) %>%
+    mutate(
+      node_type = case_when(
+        str_detect(name, "^host_") ~ "Host",
+        str_detect(name, "^parasite_") ~ "Parasite",
+        TRUE ~ NA_character_
+      ),
+      label = str_remove(name, "^host_|^parasite_"),
+      bipartite_type = node_type == "Host"
+    )
+  
+  g <- graph_from_data_frame(
+    d = edge_df,
+    vertices = node_df,
+    directed = FALSE
+  )
+  
+  list(
+    graph = g,
+    edges = edge_df,
+    nodes = node_df,
+    subset_type = subset_type,
+    subset_value = subset_value
+  )
+}
+
+#wrapped: filter + build network
+build_subset_network <- function(data,
+                                 years = NULL,
+                                 longevity_classes = NULL,
+                                 sites = NULL,
+                                 hosts = NULL,
+                                 parasites = NULL,
+                                 subset_type = "custom",
+                                 subset_value = "custom") {
+  
+  filtered_data <- filter_hp_edges(
+    data = data,
+    years = years,
+    longevity_classes = longevity_classes,
+    sites = sites,
+    hosts = hosts,
+    parasites = parasites
+  )
+  
+  network <- make_hp_network(
+    data = filtered_data,
+    subset_type = subset_type,
+    subset_value = subset_value
+  )
+  
+  network$raw_data <- filtered_data
+  
+  network
+}
+
+#test
+test_net <- build_subset_network(
+  data = hp_edges,
+  years = 2017,
+  subset_type = "year",
+  subset_value = "2017"
+)
+
+test_net$graph
+
+summarize_hp_graph(
+  g = test_net$graph,
+  subset_type = test_net$subset_type,
+  subset_value = test_net$subset_value
+)
+
+
+#stage 6: bullfrog presence - absence
+
+bullfrog <- "RACA"
+bullfrog_site_years <- hp_edges %>%
+  distinct(site_code, year, spp_code) %>%
+  group_by(site_code, year) %>%
+  summarize(
+    bullfrog_present = any(spp_code == bullfrog),
+    .groups = "drop"
+  )
+
+bullfrog_site_years %>%
+  count(bullfrog_present)
+
+#adding bullfrog presence status to all edges 
+hp_edges_bf <- hp_edges %>%
+  left_join(
+    bullfrog_site_years,
+    by = c("site_code", "year")
+  ) %>%
+  mutate(
+    bullfrog_present = replace_na(bullfrog_present, FALSE),
+    bullfrog_status = if_else(
+      bullfrog_present,
+      "Bullfrog present",
+      "Bullfrog absent"
+    )
+  )
+
+hp_edges_bf %>%
+  count(bullfrog_status)
+
+#building present/absent networks 
+bf_present_net <- build_subset_network(
+  data = hp_edges_bf %>% filter(bullfrog_present),
+  subset_type = "bullfrog_status",
+  subset_value = "present"
+)
+
+bf_absent_net <- build_subset_network(
+  data = hp_edges_bf %>% filter(!bullfrog_present),
+  subset_type = "bullfrog_status",
+  subset_value = "absent"
+)
+
+
+#network level comparison
+bullfrog_network_summary <- bind_rows(
+  summarize_hp_graph(
+    g = bf_present_net$graph,
+    subset_type = "bullfrog_status",
+    subset_value = "present"
+  ),
+  summarize_hp_graph(
+    g = bf_absent_net$graph,
+    subset_type = "bullfrog_status",
+    subset_value = "absent"
+  )
+)
+
+bullfrog_network_summary
+
+#node level comparison 
+
+bullfrog_node_summary <- bind_rows(
+  summarize_hp_nodes(
+    g = bf_present_net$graph,
+    subset_type = "bullfrog_status",
+    subset_value = "present"
+  ),
+  summarize_hp_nodes(
+    g = bf_absent_net$graph,
+    subset_type = "bullfrog_status",
+    subset_value = "absent"
+  )
+)
+
+bullfrog_node_summary
+
+#host centrality by bullfrog status
+bullfrog_node_summary %>%
+  filter(node_type == "Host") %>%
+  select(subset_value, label, degree, betweenness, eigen) %>%
+  arrange(subset_value, desc(degree))
+
+#parasite comparison 
+bullfrog_node_summary %>%
+  filter(node_type == "Parasite") %>%
+  select(subset_value, label, degree, betweenness, eigen) %>%
+  arrange(subset_value, desc(degree))
+
+#bullfrog network comparison (plot)
+bullfrog_network_summary %>%
+  pivot_longer(
+    cols = c(n_hosts, n_parasites, n_edges, connectance, modularity),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = subset_value, y = value)) +
+  geom_col() +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(
+    x = "Bullfrog status",
+    y = NULL,
+    title = "Host-parasite network structure by bullfrog status"
+  ) +
+  theme_minimal()
+
+#parasite degree by bullfrog status
+bullfrog_node_summary %>%
+  filter(node_type == "Parasite") %>%
+  ggplot(aes(x = reorder(label, degree), y = degree)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ subset_value) +
+  labs(
+    x = "Parasite taxon",
+    y = "Degree",
+    title = "Parasite host breadth by bullfrog status"
+  ) +
+  theme_minimal()
+
+
+
+#stage 8:  incorporating Bd data
+
+bd_clean <- bd %>%
+  transmute(
+    site_code = site,
+    year,
+    spp_code,
+    bd_positive = bd_infect,
+    bd_load = ave_ze_new
+  ) %>%
+  mutate(
+    
+    # convert to logical
+    bd_positive = case_when(
+      bd_positive %in% c("Y", "YES", "Positive", 1, TRUE) ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    
+    bd_load = as.numeric(bd_load)
+    
+  ) %>%
+  filter(
+    !is.na(site_code),
+    !is.na(year),
+    !is.na(spp_code)
+  )
+
+#host x site x year summaries
+bd_host_site_year <- bd_clean %>%
+  group_by(spp_code, site_code, year) %>%
+  summarize(
+    n_swabbed = n(),
+    prevalence = mean(bd_positive, na.rm = TRUE),
+    
+    mean_load = if (all(is.na(bd_load))) {
+      NA_real_
+    } else {
+      mean(bd_load, na.rm = TRUE)
+    },
+    
+    median_load = if (all(is.na(bd_load))) {
+      NA_real_
+    } else {
+      median(bd_load, na.rm = TRUE)
+    },
+    
+    max_load = if (all(is.na(bd_load))) {
+      NA_real_
+    } else {
+      max(bd_load, na.rm = TRUE)
+    },
+    
+    .groups = "drop"
+  )
+
+#aggregate to species level
+bd_host_summary <- bd_host_site_year %>%
+  group_by(spp_code) %>%
+  summarize(
+    total_swabbed = sum(n_swabbed),
+    prevalence = weighted.mean(prevalence, w = n_swabbed, na.rm = TRUE),
+    mean_load = weighted.mean(mean_load, w = n_swabbed, na.rm = TRUE),
+    median_load = median(median_load, na.rm = TRUE),
+    max_load = max(max_load, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#bd summaries only on pooled host nodes
+host_node_bd <- meta_node_summary %>%
+  filter(node_type == "Host") %>%
+  left_join(bd_host_summary, by = "spp_code")
+
+host_node_bd %>%
+  select(
+    label,
+    degree,
+    betweenness,
+    eigen,
+    total_swabbed,
+    prevalence,
+    mean_load,
+    median_load,
+    max_load
   )
 
 
+#rank by centrality
+host_node_bd %>%
+  arrange(desc(degree))
+
+host_node_bd %>%
+  arrange(desc(eigen))
+
+host_node_bd %>%
+  arrange(desc(betweenness))
+
+#scatterplots 
+
+#deg vs prevalence
+p5 <- host_node_bd %>%
+  ggplot(
+    aes(
+      degree,
+      prevalence,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  labs(
+    x = "Host degree",
+    y = "Bd prevalence",
+    title = "Host centrality and Bd prevalence"
+  ) +
+  theme_minimal()
+
+#eig vs prevalence
+p6 <- host_node_bd %>%
+  ggplot(
+    aes(
+      eigen,
+      prevalence,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  labs(
+    x = "Eigenvector centrality",
+    y = "Bd prevalence",
+    title = "Eigenvector centrality and Bd prevalence"
+  ) +
+  theme_minimal()
 
 
+#deg vs mean load
+p7 <- host_node_bd %>%
+  ggplot(
+    aes(
+      degree,
+      mean_load,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  scale_y_continuous(trans = "log1p") +
+  labs(
+    x = "Host degree",
+    y = "Mean Bd load (log1p)",
+    title = "Host centrality and Bd intensity"
+  ) +
+  theme_minimal()
 
 
+#eig vs mean load
+p8 <- host_node_bd %>%
+  ggplot(
+    aes(
+      eigen,
+      mean_load,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  scale_y_continuous(trans = "log1p") +
+  labs(
+    x = "Eigenvector centrality",
+    y = "Mean Bd load (log1p)",
+    title = "Eigenvector centrality and Bd intensity"
+  ) +
+  theme_minimal()
 
+bd_overlay_grid <-
+  (p5 + p6) /
+  (p7 + p8)
 
-
+bd_overlay_grid
 
 
 
