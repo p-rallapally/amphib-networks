@@ -365,18 +365,14 @@ V(g_meta)$bipartite_type <- V(g_meta)$type == "Host"
 table(V(g_meta)$type, V(g_meta)$bipartite_type)
 
 ggraph(g_meta, layout = "bipartite", types = V(g_meta)$bipartite_type) +
-  
   geom_edge_link(
     alpha = 0.4
   ) +
-  
   geom_node_point(
     aes(color = type),
     size = 4
   ) +
-  
   theme_void() +
-  
   labs(
     title = "Binary Host–Parasite Metaweb"
   )
@@ -1380,5 +1376,595 @@ bd_overlay_grid <-
 
 bd_overlay_grid
 
+
+#stage 9: stat time 
+
+#building summaries + checking n
+site_year_network_summary <- hp_edges_bf %>%
+  group_by(site_code, year) %>%
+  group_split() %>%
+  map_dfr(function(df_sy) {
+    
+    site_i <- unique(df_sy$site_code)
+    year_i <- unique(df_sy$year)
+    longevity_i <- unique(df_sy$longevity)
+    bullfrog_i <- unique(df_sy$bullfrog_present)
+    
+    g_sy <- build_hp_graph(df_sy)
+    
+    summarize_hp_graph(
+      g = g_sy,
+      subset_type = "site_year",
+      subset_value = paste(site_i, year_i, sep = "_")
+    ) %>%
+      mutate(
+        site_code = site_i,
+        year = year_i,
+        longevity = longevity_i[1],
+        bullfrog_present = bullfrog_i[1]
+      )
+  }) %>%
+  relocate(site_code, year, longevity, bullfrog_present)
+
+site_year_network_summary
+
+
+site_year_network_summary %>%
+  summarize(
+    n_site_years = n(),
+    n_sites = n_distinct(site_code),
+    min_year = min(year),
+    max_year = max(year)
+  )
+
+site_year_network_summary %>%
+  count(bullfrog_present)
+
+site_year_network_summary %>%
+  count(longevity)
+
+#lm
+
+lm_connectance <- lm(
+  connectance ~ bullfrog_present + longevity + year,
+  data = site_year_network_summary
+)
+
+summary(lm_connectance)
+
+lm_modularity <- lm(
+  modularity ~ bullfrog_present + longevity + year,
+  data = site_year_network_summary
+)
+
+summary(lm_modularity)
+
+lm_parasites <- lm(
+  n_parasites ~ bullfrog_present + longevity + year,
+  data = site_year_network_summary
+)
+
+summary(lm_parasites)
+
+
+site_year_network_summary %>%
+  ggplot(aes(x = bullfrog_present, y = connectance)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1, alpha = 0.6) +
+  labs(
+    x = "Bullfrog present",
+    y = "Connectance",
+    title = "Site-year network connectance by bullfrog presence"
+  ) +
+  theme_minimal()
+
+site_year_network_summary %>%
+  ggplot(aes(x = longevity, y = n_parasites)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1, alpha = 0.6) +
+  labs(
+    x = "Pond longevity",
+    y = "Parasite richness",
+    title = "Parasite richness by pond longevity"
+  ) +
+  theme_minimal()
+
+#Bullfrogs are associated with more parasite taxa, lower connectance, higher modularity
+
+# stage 10: Host projection using Jaccard similarity
+
+#Function to build a host-host Jaccard projection
+
+build_host_jaccard_projection <- function(edge_df) {
+  
+  # Binary host x parasite incidence matrix
+  incidence <- edge_df %>%
+    distinct(spp_code, parasite_name) %>%
+    mutate(present = 1L) %>%
+    pivot_wider(
+      names_from = parasite_name,
+      values_from = present,
+      values_fill = 0
+    )
+  
+  host_names <- incidence$spp_code
+  
+  host_matrix <- incidence %>%
+    select(-spp_code) %>%
+    as.matrix()
+  
+  rownames(host_matrix) <- host_names
+  
+  # Jaccard similarity:
+  # shared parasites / total unique parasites across the pair
+  jaccard_matrix <- matrix(
+    NA_real_,
+    nrow = nrow(host_matrix),
+    ncol = nrow(host_matrix),
+    dimnames = list(host_names, host_names)
+  )
+  
+  for (i in seq_len(nrow(host_matrix))) {
+    for (j in seq_len(nrow(host_matrix))) {
+      
+      host_i <- host_matrix[i, ] > 0
+      host_j <- host_matrix[j, ] > 0
+      
+      intersection <- sum(host_i & host_j)
+      union <- sum(host_i | host_j)
+      
+      jaccard_matrix[i, j] <- ifelse(
+        union == 0,
+        NA_real_,
+        intersection / union
+      )
+    }
+  }
+  
+  diag(jaccard_matrix) <- 0
+  
+  # Convert upper triangle to edge table
+  projection_edges <- as.data.frame(as.table(jaccard_matrix)) %>%
+    as_tibble() %>%
+    rename(
+      from = Var1,
+      to = Var2,
+      jaccard = Freq
+    ) %>%
+    mutate(
+      from = as.character(from),
+      to = as.character(to)
+    ) %>%
+    filter(
+      from < to,
+      !is.na(jaccard),
+      jaccard > 0
+    )
+  
+  projection_nodes <- tibble(
+    name = host_names,
+    parasite_richness = rowSums(host_matrix > 0)
+  )
+  
+  g_projection <- graph_from_data_frame(
+    d = projection_edges,
+    vertices = projection_nodes,
+    directed = FALSE
+  )
+  
+  list(
+    graph = g_projection,
+    edges = projection_edges,
+    nodes = projection_nodes,
+    incidence_matrix = host_matrix,
+    jaccard_matrix = jaccard_matrix
+  )
+}
+
+#Pooled host projection
+host_projection <- build_host_jaccard_projection(hp_edges)
+
+g_host_jaccard <- host_projection$graph
+
+host_projection$edges
+host_projection$jaccard_matrix
+
+set.seed(6262026)
+
+ggraph(g_host_jaccard, layout = "fr") +
+  geom_edge_link(
+    aes(
+      width = jaccard,
+      alpha = jaccard
+    ),
+    show.legend = TRUE
+  ) +
+  geom_node_point(
+    aes(size = parasite_richness)
+  ) +
+  geom_node_text(
+    aes(label = name),
+    repel = TRUE
+  ) +
+  scale_edge_width(
+    range = c(0.5, 4),
+    name = "Jaccard similarity"
+  ) +
+  scale_edge_alpha(
+    range = c(0.3, 1),
+    name = "Jaccard similarity"
+  ) +
+  labs(
+    title = "Host projection based on shared parasite assemblages",
+    subtitle = "Edge weights represent Jaccard similarity"
+  ) +
+  theme_void()
+
+
+# 4. Host centrality in projected network
+
+host_projection_centrality <- tibble(
+  spp_code = V(g_host_jaccard)$name,
+  
+  projected_degree = degree(g_host_jaccard),
+  
+  strength = strength(
+    g_host_jaccard,
+    weights = E(g_host_jaccard)$jaccard
+  ),
+  
+  betweenness = betweenness(
+    g_host_jaccard,
+    directed = FALSE,
+    weights = 1 / E(g_host_jaccard)$jaccard,
+    normalized = TRUE
+  ),
+  
+  closeness = closeness(
+    g_host_jaccard,
+    weights = 1 / E(g_host_jaccard)$jaccard,
+    normalized = TRUE
+  ),
+  
+  eigen = eigen_centrality(
+    g_host_jaccard,
+    weights = E(g_host_jaccard)$jaccard
+  )$vector,
+  
+  parasite_richness = V(g_host_jaccard)$parasite_richness
+) %>%
+  arrange(desc(strength))
+
+host_projection_centrality
+
+# 6. Year-specific projected networks
+
+yearly_host_projection_summary <- hp_edges %>%
+  group_split(year) %>%
+  map_dfr(function(df_year) {
+    
+    yr <- unique(df_year$year)
+    
+    projection <- build_host_jaccard_projection(df_year)
+    g <- projection$graph
+    
+    tibble(
+      year = yr,
+      n_hosts = vcount(g),
+      n_host_links = ecount(g),
+      
+      mean_jaccard = ifelse(
+        ecount(g) > 0,
+        mean(E(g)$jaccard),
+        NA_real_
+      ),
+      
+      max_jaccard = ifelse(
+        ecount(g) > 0,
+        max(E(g)$jaccard),
+        NA_real_
+      ),
+      
+      mean_strength = ifelse(
+        vcount(g) > 0,
+        mean(strength(g, weights = E(g)$jaccard)),
+        NA_real_
+      ),
+      
+      density = edge_density(g)
+    )
+  })
+
+yearly_host_projection_summary
+
+# 7. Mean Jaccard similarity through time
+
+yearly_host_projection_summary %>%
+  ggplot(aes(x = year, y = mean_jaccard)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Year",
+    y = "Mean host-pair Jaccard similarity",
+    title = "Host parasite-sharing similarity through time"
+  ) +
+  theme_minimal()
+
+
+# 8. Host-pair similarity trajectories
+yearly_host_pair_similarity <- hp_edges %>%
+  group_split(year) %>%
+  map_dfr(function(df_year) {
+    
+    yr <- unique(df_year$year)
+    
+    projection <- build_host_jaccard_projection(df_year)
+    
+    projection$edges %>%
+      mutate(
+        year = yr,
+        host_pair = paste(from, to, sep = " – ")
+      )
+  })
+
+yearly_host_pair_similarity %>%
+  ggplot(
+    aes(
+      x = year,
+      y = jaccard,
+      group = host_pair,
+      color = host_pair
+    )
+  ) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Year",
+    y = "Jaccard similarity",
+    color = "Host pair",
+    title = "Shared parasite assemblages among host pairs"
+  ) +
+  theme_minimal()
+
+
+
+# stage 9.5: Rarefaction of Bd data
+set.seed(6262026)
+
+# Number of swabs per species
+bd_clean %>%
+  count(spp_code)
+
+# Smallest sample size
+network_hosts <- c("BUBO", "PSRE", "RACA", "TAGR", "TATO")
+
+bd_network <- bd_clean %>%
+  filter(spp_code %in% network_hosts)
+
+bd_network %>%
+  count(spp_code)
+
+min_n <- bd_network %>%
+  count(spp_code) %>%
+  summarize(min_n = min(n)) %>%
+  pull()
+
+min_n
+
+rarefy_species <- function(df_species, sample_size){
+  
+  sampled <- df_species %>%
+    slice_sample(n = sample_size)
+  
+  tibble(
+    
+    prevalence =
+      mean(sampled$bd_positive),
+    
+    mean_load =
+      mean(sampled$bd_load, na.rm = TRUE),
+    
+    median_load =
+      median(sampled$bd_load, na.rm = TRUE),
+    
+    max_load =
+      max(sampled$bd_load, na.rm = TRUE)
+    
+  )
+}
+
+#repeat 1000
+n_iter <- 1000
+
+bd_rarefied <- map_dfr(
+  1:n_iter,
+  function(i){
+    bd_network %>%
+      group_by(spp_code) %>%
+      group_modify(~rarefy_species(.x, min_n)) %>%
+      ungroup() %>%
+      mutate(iteration = i)
+  }
+  
+)
+
+bd_rarefied_summary <- bd_rarefied %>%
+  
+  group_by(spp_code) %>%
+  
+  summarize(
+    
+    prevalence_mean =
+      mean(prevalence),
+    
+    prevalence_sd =
+      sd(prevalence),
+    
+    prevalence_lower =
+      quantile(prevalence, 0.025),
+    
+    prevalence_upper =
+      quantile(prevalence, 0.975),
+    
+    mean_load_mean =
+      mean(mean_load, na.rm = TRUE),
+    
+    mean_load_sd =
+      sd(mean_load, na.rm = TRUE),
+    
+    mean_load_lower =
+      quantile(mean_load, 0.025, na.rm = TRUE),
+    
+    mean_load_upper =
+      quantile(mean_load, 0.975, na.rm = TRUE),
+    
+    median_load_mean =
+      mean(median_load, na.rm = TRUE),
+    
+    max_load_mean =
+      mean(max_load, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+bd_rarefied_summary
+
+bd_comparison <- bd_host_summary %>%
+  
+  select(
+    spp_code,
+    total_swabbed,
+    prevalence,
+    mean_load
+  ) %>%
+  
+  left_join(
+    bd_rarefied_summary,
+    by = "spp_code"
+  )
+
+bd_comparison
+
+ggplot(
+  bd_rarefied_summary,
+  aes(
+    x = spp_code,
+    y = prevalence_mean
+  )
+) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(
+      ymin = prevalence_lower,
+      ymax = prevalence_upper
+    ),
+    
+    width = 0.15
+    
+  ) +
+  
+  labs(
+    x = "Host species",
+    y = "Rarefied Bd prevalence",
+    title = paste(
+      "Bd prevalence after rarefaction (n =",
+      min_n,
+      "swabs/species)"
+    )
+  ) +
+
+  theme_minimal()
+
+ggplot(
+  bd_rarefied_summary,
+  aes(
+    x = spp_code,
+    y = mean_load_mean
+  )
+) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(
+      ymin = mean_load_lower,
+      ymax = mean_load_upper
+    ),
+    width = 0.15
+  ) +
+  
+  labs(
+    x = "Host species",
+    y = "Rarefied mean Bd load",
+    title = paste(
+      "Bd load after rarefaction (n =",
+      min_n,
+      "swabs/species)"
+    )
+  ) +
+  theme_minimal()
+
+
+
+
+host_projection_bd <- host_projection_centrality %>%
+  left_join(
+    bd_rarefied_summary,
+    by = "spp_code"
+  )
+
+host_projection_bd
+
+host_projection_bd %>%
+  ggplot(
+    aes(
+      x = strength,
+      y = prevalence_mean,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = prevalence_lower,
+      ymax = prevalence_upper
+    ),
+    width = 0.03
+  ) +
+  labs(
+    x = "Projected host strength",
+    y = "Rarefied Bd prevalence",
+    title = "Parasite-sharing connectivity and standardized Bd prevalence"
+  ) +
+  theme_minimal()
+
+host_projection_bd %>%
+  ggplot(
+    aes(
+      x = strength,
+      y = mean_load_mean,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = mean_load_lower,
+      ymax = mean_load_upper
+    ),
+    width = 0.03
+  ) +
+  scale_y_continuous(trans = "log1p") +
+  labs(
+    x = "Projected host strength",
+    y = "Rarefied mean Bd load",
+    title = "Parasite-sharing connectivity and standardized Bd load"
+  ) +
+  theme_minimal()
 
 
