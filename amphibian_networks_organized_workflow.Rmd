@@ -1,0 +1,5010 @@
+---
+title: "CA Amphibian Host–Parasite Networks: Organized Exploratory Workflow"
+author: "Pratyush Rallapally"
+date: "2026-07-29"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+# Purpose of this document
+
+This file reorganizes the exploratory analysis around three scientific hypotheses rather than the order in which the code was written. Original stage numbers are retained in headings and in the crosswalk below. Written interpretations from the previous workflow are retained, but claims that are provisional, superseded, or not yet supported are labeled accordingly.
+
+## Current hypotheses
+
+**H1 — Bullfrog detection.** Site-years with independently detected bullfrogs differ in parasite richness, connectance, and modularity from site-years without bullfrog detections.
+
+**H2 — Pond permanence.** Pond permanence predicts parasite richness and network architecture after accounting for bullfrog detection, year, and sampling effort. Permanence is treated as a habitat/hydroperiod characteristic that may interact with anthropogenic stressors, not automatically as an anthropogenic disturbance itself.
+
+**H3 — Temporal dynamics.** Annual network dissimilarity within ponds can be partitioned into change associated with taxon turnover and change among taxa shared between years. Life-stage, drought-year, and seasonal partitions remain planned extensions rather than completed tests.
+
+**Exploratory Bd question.** Does position in the macroparasite network correspond to Bd infection risk? This is retained as a separate exploratory branch rather than a fourth coequal hypothesis.
+
+## Status labels
+
+- **Core:** required for the current paper workflow.
+- **Supporting/descriptive:** useful context but not the main inferential test.
+- **Needs revision:** direction is relevant, but the current implementation or interpretation is not final.
+- **Superseded:** replaced by a later method and retained only for provenance.
+- **Deprioritized:** methodologically interpretable but weakly connected to the paper's main network questions.
+
+## Stage crosswalk
+
+| Original stage | Organized section | Status | Role |
+|---|---|---|---|
+| 0–2 | Shared foundation | Core | Data cleaning, date repair, and binary edge construction |
+| 3–5 | Descriptive baseline | Supporting/descriptive | Metaweb, subset metrics, and node roles |
+| 5.5 | Shared utilities | Core | Reusable subnetwork construction |
+| 6 | Superseded archive | Superseded | Bullfrog status inferred from parasite records |
+| 8, 9.5, 9.6, 18 | Exploratory Bd branch | Supporting/deprioritized | Host-specific Bd prevalence and intensity |
+| 9 | Superseded archive | Superseded | Ordinary linear models for network outcomes |
+| 10 | H3 / exploratory Bd bridge | Supporting/descriptive | Host projection and Jaccard similarity |
+| 11–12 | Deprioritized archive | Deprioritized / superseded | Weak Bd–macroparasite and environmental directions |
+| 13 (temporal) | H3 | Supporting sensitivity analysis | Pooled/shared-site network beta diversity |
+| 13 (survey status) | H1/H2 | Core | Independent bullfrog detection |
+| 14–15 | H1/H2 | Core | Predictor overlap and sampling effort |
+| 16 | Superseded archive | Needs revision / superseded | First GLMM pass |
+| 17 | H1/H2 | Needs revision | Bipartite modularity and null comparison |
+| 20 | H3 | Core | Within-site turnover versus rewiring |
+| 21 | H2 support | Optional supporting | Cleaner site-year pond covariates |
+| 22 | Shared diagnostics | Core | Model validation utilities |
+| 23 | H1/H2 | Core, unresolved | Correct parasite-richness sampling frame |
+| 24 | H1/H2 | Core, unresolved | Validated connectance model |
+
+# 1. Shared foundation
+
+## 1.1 Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(igraph)
+library(ggraph)
+library(janitor)
+library(lubridate)
+library(vegan)
+library(knitr)
+library(patchwork)
+library(glmmTMB)
+library(DHARMa)
+library(bipartite)
+
+# Optional audit of available files / column names
+files <- list.files("Desktop/briggs/networks/kacie_csvs", pattern = "\\.csv$", full.names = TRUE)
+
+if (length(files) > 0) {
+  setNames(
+    lapply(files, function(f) names(read.csv(f, nrows = 0))),
+    basename(files)
+  )
+}
+```
+
+## 1.2 Stage 1 — Read and standardize data
+
+**Status:** Core. All later sections depend on these standardized objects.
+
+```{r stage-01-import}
+#stage 1: read + standardize data
+
+amphib_dissect <- read_csv("amphib_dissect.csv") %>%
+  clean_names()
+
+amphib_parasite <- read_csv("amphib_parasite.csv") %>%
+  clean_names()
+
+bd <- read_csv("bd.csv") %>%
+  clean_names()
+
+lut_amphib_parasite <- read_csv("lut_amphib_parasite.csv") %>%
+  clean_names()
+
+lut_freeliving <- read_csv("lut_freelving.csv") %>%
+  clean_names()
+
+netting_info <- read_csv("netting_infor.csv") %>%
+  clean_names()
+
+site_info <- read_csv("Site_information_.csv") %>%
+  clean_names()
+
+survey_spp <- read_csv("survey_spp.csv") %>%
+  clean_names()
+
+transect_sppsum_meta <- read_csv("transect_SppSUM__META_.csv") %>%
+  clean_names()
+
+visual_spp <- read_csv("visual_spp.csv") %>%
+  clean_names()
+
+wetland_info <- read_csv("wetland_infor.csv") %>%
+  clean_names()
+```
+
+## 1.3 Stage 0 — Repair dates and standardize years
+
+**Status:** Core. This stage follows import because it repairs already loaded tables.
+
+```{r stage-00-date-repair}
+#stage 0: fixing the dates in some of the datasets bc the years were scuffed (likely bc excel)
+
+#hopefully the collection code is more accurate 
+amphib_dissect <- amphib_dissect %>%
+  mutate(
+    collect_date = str_extract(collect_code, "\\d{8}"),
+    collect_date = ymd(collect_date),
+    year = year(collect_date)
+  )
+
+amphib_parasite <- amphib_parasite %>%
+  mutate(
+    date = str_extract(collect_code, "\\d{8}"),
+    date = ymd(date),
+    year = year(date)
+  )
+
+#structure check
+
+list(
+  amphib_dissect = dim(amphib_dissect),
+  amphib_parasite = dim(amphib_parasite),
+  bd = dim(bd),
+  site_info = dim(site_info),
+  survey_spp = dim(survey_spp),
+  wetland_info = dim(wetland_info)
+)
+
+#checking clean names
+names(amphib_dissect)
+names(amphib_parasite)
+names(bd)
+names(site_info)
+names(survey_spp)
+names(wetland_info)
+
+#date/year standardization
+
+amphib_dissect <- amphib_dissect %>%
+  mutate(
+    collect_date = as_date(collect_date),
+    year = year(collect_date)
+  )
+
+amphib_parasite <- amphib_parasite %>%
+  mutate(
+    date = as_date(date),
+    year = year(date)
+  )
+
+bd <- bd %>%
+  mutate(
+    date = as_date(date),
+    year = as.integer(year)
+  )
+
+survey_spp <- survey_spp %>%
+  mutate(
+    date = as_date(date),
+    year = as.integer(year)
+  )
+
+wetland_info <- wetland_info %>%
+  mutate(
+    date = as_date(date),
+    year = as.integer(year)
+  )
+
+netting_info <- netting_info %>%
+  mutate(
+    date = as_date(date),
+    year = as.integer(year)
+  )
+
+#sanity check key IDs
+
+amphib_dissect %>%
+  summarize(
+    n_rows = n(),
+    n_dissect_codes = n_distinct(dissect_code),
+    n_sites = n_distinct(site_code),
+    n_species = n_distinct(spp_code),
+    min_year = min(year, na.rm = TRUE),
+    max_year = max(year, na.rm = TRUE)
+  )
+
+amphib_parasite %>%
+  summarize(
+    n_rows = n(),
+    n_dissect_codes = n_distinct(dissect_code),
+    n_parasites = n_distinct(parasite_name),
+    min_year = min(year, na.rm = TRUE),
+    max_year = max(year, na.rm = TRUE)
+  )
+
+site_info %>%
+  count(longevity, sort = TRUE)
+
+wetland_info %>%
+  summarize(
+    n_rows = n(),
+    n_sites = n_distinct(site),
+    min_year = min(year, na.rm = TRUE),
+    max_year = max(year, na.rm = TRUE)
+  )
+```
+
+## 1.4 Stage 2 — Construct the master host–parasite interaction table
+
+**Status:** Core.
+
+An edge represents at least one observed host–parasite association for a host species at a site in a year. The edge is binary after collapsing individual dissections; it is not an abundance-weighted transmission edge.
+
+```{r stage-02-edge-table}
+#stage 2: construct master host–parasite interaction table
+
+#cleaning disssection data
+
+dissect_clean <- amphib_dissect %>%
+  select(
+    dissect_code,
+    site_code,
+    spp_code,
+    collect_date,
+    year,
+    parasites
+  ) %>%
+  filter(
+    !is.na(dissect_code),
+    !is.na(site_code),
+    !is.na(spp_code),
+    !is.na(year)
+  )
+
+#cleaning parasite
+parasite_clean <- amphib_parasite %>%
+  select(
+    dissect_code,
+    parasite_name,
+    parasite_cnt,
+    presence
+  ) %>%
+  mutate(
+    parasite_name = str_trim(parasite_name)
+  ) %>%
+  filter(
+    !is.na(dissect_code),
+    !is.na(parasite_name),
+    parasite_name != ""
+  )
+
+#joining parasite obs to host metadata
+hp_raw <- parasite_clean %>%
+  left_join(
+    dissect_clean,
+    by = "dissect_code"
+  )
+
+hp_raw <- hp_raw %>% #removing incomplete obs
+  filter(
+    !is.na(site_code),
+    !is.na(spp_code),
+    !is.na(year)
+  )
+
+#convert to binary presence
+hp_binary <- hp_raw %>%
+mutate(
+  interaction = case_when(
+    !is.na(parasite_cnt) & parasite_cnt > 0 ~ 1L,
+    presence %in% c(TRUE, "Y", "Yes", 1) ~ 1L,
+    TRUE ~ 0L
+  )
+)
+
+
+#collapse to unique interactions (same host with the same site/year are collapsed into one)
+hp_edges <- hp_binary %>%
+  group_by(
+    site_code,
+    year,
+    spp_code,
+    parasite_name
+  ) %>%
+  summarize(
+    interaction = max(interaction),
+    n_hosts_examined = n_distinct(dissect_code),
+    total_parasites = sum(parasite_cnt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(interaction == 1)
+
+
+#inc. pond longevity
+hp_edges <- hp_edges %>%
+  left_join(
+    site_info %>%
+      select(site_code, longevity),
+    by = "site_code"
+  )
+
+#sanity checking
+cat("\nUnique interactions:", nrow(hp_edges), "\n")
+
+cat("\nHost species:", n_distinct(hp_edges$spp_code), "\n")
+
+cat("Parasite taxa:", n_distinct(hp_edges$parasite_name), "\n")
+
+cat("Sites:", n_distinct(hp_edges$site_code), "\n")
+
+cat("Years:", n_distinct(hp_edges$year), "\n")#thank god they're all reasonable
+
+# interactions per year
+hp_edges %>%
+  count(year)
+
+# interactions by longevity class
+hp_edges %>%
+  count(longevity)
+
+# host richness by site
+hp_edges %>%
+  distinct(site_code, spp_code) %>%
+  count(site_code, name = "host_richness")
+
+# parasite richness by site
+hp_edges %>%
+  distinct(site_code, parasite_name) %>%
+  count(site_code, name = "parasite_richness")
+```
+
+# 2. Descriptive baseline shared by all hypotheses
+
+These stages characterize the pooled system and establish the objects reused by H1–H3. They are descriptive; pooled differences are not treated as replicated inferential evidence.
+
+## 2.1 Stage 3 — Pooled metaweb
+
+**Status:** Supporting/descriptive. Louvain modularity generated here is exploratory and is replaced by the bipartite method in Stage 17 for final modularity claims.
+
+```{r stage-03-metaweb}
+#stage 3: build metaweb
+
+#creating binary edge list
+meta_edges <- hp_edges %>%
+  distinct(
+    spp_code,
+    parasite_name
+  ) %>%
+  mutate(
+    from = paste0("host_", spp_code),
+    to   = paste0("parasite_", parasite_name),
+    weight = 1
+  )
+
+#creating node table
+host_nodes <- meta_edges %>%
+  distinct(from) %>%
+  transmute(
+    name = from,
+    type = "Host",
+    label = str_remove(from, "^host_")
+  )
+
+parasite_nodes <- meta_edges %>%
+  distinct(to) %>%
+  transmute(
+    name = to,
+    type = "Parasite",
+    label = str_remove(to, "^parasite_")
+  )
+
+nodes <- bind_rows(
+  host_nodes,
+  parasite_nodes
+)
+
+#building graph + diagnostics
+g_meta <- graph_from_data_frame(
+  d = meta_edges %>%
+    select(from, to, weight),
+  vertices = nodes,
+  directed = FALSE
+)
+
+cat("Nodes:", vcount(g_meta), "\n")
+cat("Edges:", ecount(g_meta), "\n\n")
+
+table(V(g_meta)$type)
+
+is_bipartite(g_meta)
+
+igraph::components(g_meta)$no
+
+
+#degree dist
+node_degree <- tibble(
+  node = igraph::V(g_meta)$name,
+  type = igraph::V(g_meta)$type,
+  degree = igraph::degree(g_meta)
+)
+
+host_degree <- node_degree %>%
+  filter(type == "Host") %>%
+  arrange(desc(degree))
+
+parasite_degree <- node_degree %>%
+  filter(type == "Parasite") %>%
+  arrange(desc(degree))
+
+host_degree
+
+parasite_degree
+
+
+#viz 
+set.seed(6262026)
+
+V(g_meta)$bipartite_type <- V(g_meta)$type == "Host"
+
+table(V(g_meta)$type, V(g_meta)$bipartite_type)
+
+ggraph(g_meta, layout = "bipartite", types = V(g_meta)$bipartite_type) +
+  geom_edge_link(
+    alpha = 0.4
+  ) +
+  geom_node_point(
+    aes(color = type),
+    size = 4
+  ) +
+  theme_void() +
+  labs(
+    title = "Binary Host–Parasite Metaweb"
+  )
+
+#centrality
+meta_centrality <- tibble(
+  node = V(g_meta)$name,
+  type = V(g_meta)$type,
+  degree = degree(g_meta),
+  betweenness = betweenness(
+    g_meta,
+    normalized = TRUE
+  ),
+  eigen = eigen_centrality(g_meta)$vector
+)
+
+meta_centrality %>%
+  arrange(desc(eigen))
+
+
+#host richness
+host_richness <- hp_edges %>%
+  distinct(
+    spp_code,
+    parasite_name
+  ) %>%
+  count(
+    spp_code,
+    name = "parasite_richness"
+  ) 
+
+host_richness %>%
+  arrange(desc(parasite_richness))
+
+
+#parasite host breadth
+parasite_breadth <- hp_edges %>%
+  distinct(
+    spp_code,
+    parasite_name
+  ) %>%
+  count(
+    parasite_name,
+    name = "host_breadth"
+  ) 
+
+parasite_breadth %>%
+  arrange(desc(host_breadth))
+```
+
+## 2.2 Stage 4 — Network summaries by year and pond permanence
+
+**Status:** Supporting/descriptive. The annual and permanence-pooled networks provide context for H2 and H3 but should not be interpreted as replicated tests.
+
+```{r stage-04-network-subsets}
+
+# STAGE 4: Network-level metrics for subsets
+
+# Function to build an igraph object from an interaction table
+
+build_hp_graph <- function(edge_df) {
+
+  edges <- edge_df |>
+    dplyr::distinct(spp_code, parasite_name) |>
+    dplyr::mutate(
+      from = paste0("host_", spp_code),
+      to = paste0("parasite_", parasite_name),
+      weight = 1
+    ) |>
+    dplyr::select(from, to, weight)
+
+  nodes <- tibble::tibble(
+    name = unique(c(edges$from, edges$to))
+  ) |>
+    dplyr::mutate(
+      node_type = dplyr::case_when(
+        stringr::str_detect(name, "^host_") ~ "Host",
+        stringr::str_detect(name, "^parasite_") ~ "Parasite",
+        TRUE ~ NA_character_
+      ),
+      bipartite_type = node_type == "Host"
+    )
+
+  igraph::graph_from_data_frame(
+    d = edges,
+    vertices = nodes,
+    directed = FALSE
+  )
+}
+
+
+# ------------------------------------------------------------
+# Function to calculate network-level metrics
+# ------------------------------------------------------------
+
+summarize_hp_graph <- function(g, subset_type, subset_value) {
+
+  node_tbl <- tibble::tibble(
+    node = igraph::V(g)$name,
+    node_type = igraph::V(g)$node_type
+  )
+
+  n_hosts <- node_tbl |>
+    dplyr::filter(node_type == "Host") |>
+    nrow()
+
+  n_parasites <- node_tbl |>
+    dplyr::filter(node_type == "Parasite") |>
+    nrow()
+
+  n_edges <- igraph::ecount(g)
+
+  possible_edges <- n_hosts * n_parasites
+
+  connectance <- ifelse(
+    possible_edges > 0,
+    n_edges / possible_edges,
+    NA_real_
+  )
+
+  comps <- igraph::components(g)
+
+  giant_component_size <- max(comps$csize)
+
+  giant_component_fraction <-
+    giant_component_size / igraph::vcount(g)
+
+  modularity_value <- if (
+    igraph::ecount(g) > 0 &&
+    igraph::vcount(g) > 2
+  ) {
+    igraph::modularity(
+      igraph::cluster_louvain(g)
+    )
+  } else {
+    NA_real_
+  }
+
+  tibble::tibble(
+    subset_type = subset_type,
+    subset_value = subset_value,
+    n_hosts = n_hosts,
+    n_parasites = n_parasites,
+    n_nodes = igraph::vcount(g),
+    n_edges = n_edges,
+    connectance = connectance,
+    mean_degree = mean(igraph::degree(g)),
+    modularity = modularity_value,
+    n_components = comps$no,
+    giant_component_size = giant_component_size,
+    giant_component_fraction = giant_component_fraction
+  )
+}
+
+
+# ------------------------------------------------------------
+# Pooled metaweb summary
+# ------------------------------------------------------------
+
+g_meta <- build_hp_graph(hp_edges)
+
+summary_meta <- summarize_hp_graph(
+  g = g_meta,
+  subset_type = "pooled",
+  subset_value = "all_years"
+)
+
+summary_meta
+
+
+# ------------------------------------------------------------
+# Year-specific summaries
+# ------------------------------------------------------------
+
+yearly_network_summary <- hp_edges |>
+  dplyr::group_by(year) |>
+  dplyr::group_split() |>
+  purrr::map_dfr(function(df_year) {
+
+    yr <- unique(df_year$year)
+
+    g_year <- build_hp_graph(df_year)
+
+    summarize_hp_graph(
+      g = g_year,
+      subset_type = "year",
+      subset_value = as.character(yr)
+    )
+  })
+
+yearly_network_summary
+
+
+# ------------------------------------------------------------
+# Pond-longevity summaries
+# ------------------------------------------------------------
+
+longevity_network_summary <- hp_edges |>
+  dplyr::filter(
+    !is.na(longevity),
+    longevity != ""
+  ) |>
+  dplyr::group_by(longevity) |>
+  dplyr::group_split() |>
+  purrr::map_dfr(function(df_longevity) {
+
+    lon <- unique(df_longevity$longevity)
+
+    g_longevity <- build_hp_graph(df_longevity)
+
+    summarize_hp_graph(
+      g = g_longevity,
+      subset_type = "longevity",
+      subset_value = as.character(lon)
+    )
+  })
+
+longevity_network_summary
+
+
+# ------------------------------------------------------------
+# Combine all summaries
+# ------------------------------------------------------------
+
+network_summary <- dplyr::bind_rows(
+  summary_meta,
+  yearly_network_summary,
+  longevity_network_summary
+)
+
+network_summary
+
+
+# ------------------------------------------------------------
+# Figures
+# ------------------------------------------------------------
+
+# A: Network size through time
+
+p1 <- yearly_network_summary |>
+  dplyr::mutate(
+    year = as.integer(subset_value)
+  ) |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = year,
+      y = n_edges
+    )
+  ) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point() +
+  ggplot2::labs(
+    x = "Year",
+    y = "Number of interactions",
+    title = "A. Network size through time"
+  ) +
+  ggplot2::theme_minimal()
+
+
+# B: Connectance through time
+
+p2 <- yearly_network_summary |>
+  dplyr::mutate(
+    year = as.integer(subset_value)
+  ) |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = year,
+      y = connectance
+    )
+  ) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point() +
+  ggplot2::labs(
+    x = "Year",
+    y = "Connectance",
+    title = "B. Connectance through time"
+  ) +
+  ggplot2::theme_minimal()
+
+
+# C: Louvain modularity through time
+
+p3 <- yearly_network_summary |>
+  dplyr::mutate(
+    year = as.integer(subset_value)
+  ) |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = year,
+      y = modularity
+    )
+  ) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point() +
+  ggplot2::labs(
+    x = "Year",
+    y = "Louvain modularity",
+    title = "C. Modularity through time"
+  ) +
+  ggplot2::theme_minimal()
+
+
+# D: Network metrics by pond longevity
+
+p4 <- longevity_network_summary |>
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(
+      c(
+        "n_hosts",
+        "n_parasites",
+        "n_edges",
+        "connectance",
+        "modularity"
+      )
+    ),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = subset_value,
+      y = value
+    )
+  ) +
+  ggplot2::geom_col() +
+  ggplot2::facet_wrap(
+    ggplot2::vars(metric),
+    scales = "free_y"
+  ) +
+  ggplot2::labs(
+    x = "Pond longevity",
+    y = NULL,
+    title = "D. Network structure by pond longevity"
+  ) +
+  ggplot2::theme_minimal()
+
+
+# Assemble plots into a 2 × 2 grid
+
+network_grid <- patchwork::wrap_plots(
+  p1,
+  p2,
+  p3,
+  p4,
+  ncol = 2
+)
+
+network_grid
+
+
+# ------------------------------------------------------------
+# Optional export
+# ------------------------------------------------------------
+
+# ggplot2::ggsave(
+#   filename = "network_summary_2x2.png",
+#   plot = network_grid,
+#   width = 12,
+#   height = 9,
+#   dpi = 300
+# )
+
+```
+
+## 2.3 Stage 5 — Node-level roles
+
+**Status:** Supporting/descriptive.
+
+```{r stage-05-node-metrics}
+#stage 5: node level metrics
+
+#function for node centality per graph
+summarize_hp_nodes <- function(g, subset_type, subset_value) {
+  
+  node_name <- V(g)$name
+  
+  label <- str_remove(node_name, "^host_|^parasite_")
+  
+  node_type <- V(g)$node_type
+  
+  tibble(
+    subset_type = subset_type,
+    subset_value = subset_value,
+    node = node_name,
+    node_type = node_type,
+    label = label,
+    spp_code = if_else(
+      node_type == "Host",
+      label,
+      NA_character_
+    ),
+    
+    parasite_name = if_else(
+      node_type == "Parasite",
+      label,
+      NA_character_
+    ),
+    degree = degree(g),
+    betweenness = betweenness(g, normalized = TRUE),
+    closeness = igraph::closeness(g, normalized = TRUE),
+    eigen = eigen_centrality(g)$vector
+  )
+}
+
+#pooled node centrality
+g_meta <- build_hp_graph(hp_edges)
+
+meta_node_summary <- summarize_hp_nodes(
+  g_meta,
+  "pooled",
+  "all_years"
+)
+
+meta_node_summary %>%
+  arrange(desc(eigen))
+
+#year-specific node centrality
+yearly_node_summary <- hp_edges %>%
+  group_split(year) %>%
+  map_dfr(function(df_year) {
+    
+    yr <- unique(df_year$year)
+    
+    g_year <- build_hp_graph(df_year)
+    
+    summarize_hp_nodes(
+      g = g_year,
+      subset_type = "year",
+      subset_value = as.character(yr)
+    )
+  })
+
+yearly_node_summary
+
+#longevity-specific node centrality
+longevity_node_summary <- hp_edges %>%
+  dplyr::filter(!is.na(longevity), longevity != "") %>%
+  group_split(longevity) %>%
+  map_dfr(function(df_longevity) {
+    
+    lon <- unique(df_longevity$longevity)
+    
+    g_lon <- build_hp_graph(df_longevity)
+    
+    summarize_hp_nodes(
+      g = g_lon,
+      subset_type = "longevity",
+      subset_value = as.character(lon)
+    )
+  })
+
+longevity_node_summary
+
+#combined node summaries
+node_summary <- bind_rows(
+  meta_node_summary,
+  yearly_node_summary,
+  longevity_node_summary
+)
+
+node_summary
+
+
+#most central hosts + parasites
+top_hosts <- meta_node_summary %>%
+  dplyr::filter(node_type == "Host") %>%
+  arrange(desc(degree))
+
+top_hosts
+
+top_parasites <- meta_node_summary %>%
+  dplyr::filter(node_type == "Parasite") %>%
+  arrange(desc(degree))
+
+top_parasites
+
+#plots
+
+#top hosts by parasite richness/degree
+top_hosts %>%
+  ggplot(aes(x = reorder(label, degree), y = degree)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "Host species",
+    y = "Degree",
+    title = "Host parasite richness in pooled metaweb"
+  ) +
+  theme_minimal()
+
+
+#top parasites by centrality/degree
+top_parasites %>%
+  ggplot(aes(x = reorder(label, degree), y = degree)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "Parasite taxon",
+    y = "Degree",
+    title = "Parasite host breadth in pooled metaweb"
+  ) +
+  theme_minimal()
+
+
+#host centrality thru time 
+yearly_node_summary %>%
+  dplyr::filter(node_type == "Host") %>%
+  mutate(year = as.integer(subset_value)) %>%
+  ggplot(aes(x = year,
+             y = degree,
+             group = label,
+             color = label)) +
+  geom_line(alpha = 0.8, linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    x = "Year",
+    y = "Degree",
+    color = "Host species",
+    title = "Host parasite richness through time"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right"
+  )
+
+
+#same thing for parasites 
+
+top_n_parasites <- 8
+
+top_parasite_labels <- yearly_node_summary %>%
+  dplyr::filter(node_type == "Parasite") %>%
+  group_by(label) %>%
+  summarize(
+    mean_degree = mean(degree, na.rm = TRUE),
+    max_degree = max(degree, na.rm = TRUE),
+    n_years_observed = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_degree), desc(max_degree)) %>%
+  slice_head(n = top_n_parasites) %>%
+  pull(label)
+
+parasite_plot_df <- yearly_node_summary %>%
+  dplyr::filter(node_type == "Parasite") %>%
+  mutate(
+    year = as.integer(subset_value),
+    highlight = if_else(label %in% top_parasite_labels, label, "Other parasites"),
+    is_highlight = label %in% top_parasite_labels
+  )
+
+parasite_plot <- ggplot() +
+  
+  # Background lines: all non-top parasites
+  geom_line(
+    data = parasite_plot_df %>% dplyr::filter(!is_highlight),
+    aes(
+      x = year,
+      y = degree,
+      group = label
+    ),
+    color = "gray75",
+    alpha = 0.5,
+    linewidth = 0.5
+  ) +
+  
+  geom_point(
+    data = parasite_plot_df %>% dplyr::filter(!is_highlight),
+    aes(
+      x = year,
+      y = degree,
+      group = label
+    ),
+    color = "gray75",
+    alpha = 0.5,
+    size = 1
+  ) +
+  
+  # Highlighted lines: top parasites
+  geom_line(
+    data = parasite_plot_df %>% dplyr::filter(is_highlight),
+    aes(
+      x = year,
+      y = degree,
+      group = label,
+      color = label
+    ),
+    linewidth = 1.1
+  ) +
+  
+  geom_point(
+    data = parasite_plot_df %>% dplyr::filter(is_highlight),
+    aes(
+      x = year,
+      y = degree,
+      color = label
+    ),
+    size = 2
+  ) +
+  
+  labs(
+    x = "Year",
+    y = "Degree",
+    color = "Top parasites",
+    title = "Parasite host breadth through time",
+    subtitle = paste0(
+      "Top ", top_n_parasites,
+      " parasites by average yearly degree highlighted; all others shown in gray"
+    )
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 8),
+    plot.title = element_text(face = "bold")
+  )
+
+parasite_plot
+```
+
+## 2.4 Stage 5.5 — Reusable subnetwork builder
+
+**Status:** Core utility.
+
+```{r stage-055-subnetwork-builder}
+#stage 5.5: subnetwork builder
+
+#filtering hp_edges
+filter_hp_edges <- function(data,
+                            years = NULL,
+                            longevity_classes = NULL,
+                            sites = NULL,
+                            hosts = NULL,
+                            parasites = NULL) {
+  
+  out <- data
+  
+  if (!is.null(years)) {
+    out <- out %>% filter(year %in% years)
+  }
+  
+  if (!is.null(longevity_classes)) {
+    out <- out %>% filter(longevity %in% longevity_classes)
+  }
+  
+  if (!is.null(sites)) {
+    out <- out %>% filter(site_code %in% sites)
+  }
+  
+  if (!is.null(hosts)) {
+    out <- out %>% filter(spp_code %in% hosts)
+  }
+  
+  if (!is.null(parasites)) {
+    out <- out %>% filter(parasite_name %in% parasites)
+  }
+  
+  out
+}
+
+
+#build edge list + graph from any filtered hp_edges table
+make_hp_network <- function(data,
+                            subset_type = "custom",
+                            subset_value = "custom") {
+  
+  edge_df <- data %>%
+    distinct(spp_code, parasite_name) %>%
+    filter(
+      !is.na(spp_code),
+      !is.na(parasite_name),
+      spp_code != "",
+      parasite_name != ""
+    ) %>%
+    mutate(
+      from = paste0("host_", spp_code),
+      to = paste0("parasite_", parasite_name),
+      weight = 1
+    ) %>%
+    select(from, to, weight)
+  
+  node_df <- tibble(
+    name = unique(c(edge_df$from, edge_df$to))
+  ) %>%
+    mutate(
+      node_type = case_when(
+        str_detect(name, "^host_") ~ "Host",
+        str_detect(name, "^parasite_") ~ "Parasite",
+        TRUE ~ NA_character_
+      ),
+      label = str_remove(name, "^host_|^parasite_"),
+      bipartite_type = node_type == "Host"
+    )
+  
+  g <- graph_from_data_frame(
+    d = edge_df,
+    vertices = node_df,
+    directed = FALSE
+  )
+  
+  list(
+    graph = g,
+    edges = edge_df,
+    nodes = node_df,
+    subset_type = subset_type,
+    subset_value = subset_value
+  )
+}
+
+#wrapped: filter + build network
+build_subset_network <- function(data,
+                                 years = NULL,
+                                 longevity_classes = NULL,
+                                 sites = NULL,
+                                 hosts = NULL,
+                                 parasites = NULL,
+                                 subset_type = "custom",
+                                 subset_value = "custom") {
+  
+  filtered_data <- filter_hp_edges(
+    data = data,
+    years = years,
+    longevity_classes = longevity_classes,
+    sites = sites,
+    hosts = hosts,
+    parasites = parasites
+  )
+  
+  network <- make_hp_network(
+    data = filtered_data,
+    subset_type = subset_type,
+    subset_value = subset_value
+  )
+  
+  network$raw_data <- filtered_data
+  
+  network
+}
+
+#test
+test_net <- build_subset_network(
+  data = hp_edges,
+  years = 2017,
+  subset_type = "year",
+  subset_value = "2017"
+)
+
+test_net$graph
+
+summarize_hp_graph(
+  g = test_net$graph,
+  subset_type = test_net$subset_type,
+  subset_value = test_net$subset_value
+)
+```
+
+## 2.5 Retained descriptive interpretations
+
+### Original written interpretations
+
+- More even parasite importance distribution (9 with max degree 5).
+- High-degree parasites are mostly trematodes (snail dependent?).
+- High connectance/density plus low modularity.
+- The same “big dog” amphibians recur, especially TATO and PSRE.
+- Permanent ponds had the richest parasite communities, semi-permanent ponds had the densest interaction networks, and temporary ponds had the greatest modularity.
+- Identify dominant parasites by year, dynamic host breadth, and imbalance among parasite importance.
+
+### Earlier overall synthesis, retained as provisional
+
+- The amphibian host–parasite community forms a highly connected, weakly modular network characterized by extensive parasite sharing among hosts.
+- Network organization remained stable through time despite substantial annual variation in parasite richness and interaction number.
+- Pond longevity influenced both parasite diversity and network architecture, with permanent ponds supporting the most diverse parasite communities.
+- A small number of host species and parasites consistently occupied central positions within the network and likely contribute disproportionately to parasite transmission dynamics.
+- Preliminary work suggested that bullfrog presence was associated with changes in host–parasite network structure, while Bd burden appeared to be driven more by host species than by pooled network centrality.
+
+**Current status of these claims:** The first and fourth bullets remain useful descriptive summaries. The temporal-stability claim is too strong after the within-site turnover analysis. The longevity and bullfrog claims remain provisional until Stages 23–24 and a site-year modularity analysis pass diagnostics.
+
+# 3. H1 and H2 — Shared ecological-driver workflow
+
+H1 and H2 use the same site-year response models. Each coefficient answers a different hypothesis, so the analysis is organized jointly rather than duplicated.
+
+## 3.1 Environmental covariate preparation
+
+**Status:** Optional supporting. Required only when dynamic pond variables such as depth, area, trophic state, or drying are included. Longevity can be analyzed without these variables.
+
+```{r h12-environmental-prep}
+# --- site-level static properties (site_info) ---
+env_site <- site_info %>%
+  select(
+    site_code,
+    longevity,
+    class,
+    origin,
+    elevation_m,
+    property_area_m2,
+    meta_comm_area_m2,
+    latitude,
+    longitude
+  )
+
+# STAGE 21: Match environmental conditions to sampling dates more
+# precisely, and fix the arbitrary first(na.omit(trophic_state)) pick
+# from Stage 11's env_site_year
+
+# Safe mean: returns NA instead of NaN when every value is missing
+safe_mean <- function(x) {
+  if (all(is.na(x))) {
+    NA_real_
+  } else {
+    mean(x, na.rm = TRUE)
+  }
+}
+
+# Safe mode: returns NA when every value is missing or blank
+safe_mode <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+
+  if (length(x) == 0) {
+    return(NA_character_)
+  }
+
+  tab <- table(x)
+
+  # Deterministic choice if multiple categories are tied
+  sort(names(tab)[tab == max(tab)])[1]
+}
+
+wetland_info <- wetland_info %>%
+  mutate(
+    trophic_state = trophic_state %>%
+      str_to_lower() %>%
+      str_trim(),
+
+    dry_clean = dry %>%
+      as.character() %>%
+      str_to_upper() %>%
+      str_trim(),
+
+    dry_logical = case_when(
+      dry_clean %in% c("TRUE", "T", "1", "Y", "YES")  ~ TRUE,
+      dry_clean %in% c("FALSE", "F", "0", "N", "NO") ~ FALSE,
+      TRUE ~ NA
+    )
+  )
+
+env_site_year <- wetland_info %>%
+  rename(site_code = site) %>%
+  group_by(site_code, year) %>%
+  summarize(
+    pond_area_m = safe_mean(pond_area_m),
+    perimeter_m = safe_mean(perimeter_m),
+    max_depth_m = safe_mean(max_depth_m),
+
+    trophic_state = safe_mode(trophic_state),
+
+    frac_dry = safe_mean(as.numeric(dry_logical)),
+
+    n_assessments = n(),
+    n_dry_assessments = sum(!is.na(dry_logical)),
+    n_trophic_assessments = sum(!is.na(trophic_state)),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ever_dry = case_when(
+      is.na(frac_dry) ~ NA,
+      frac_dry > 0 ~ TRUE,
+      TRUE ~ FALSE
+    )
+  )
+
+env_site_year
+```
+
+## 3.2 Stage 13 — Independent bullfrog detection
+
+**Status:** Core. This supersedes Stage 6. `bullfrog_detected` is based on `survey_spp` and `visual_spp`; unsurveyed site-years remain missing rather than being forced to absence.
+
+```{r h12-stage-13-bullfrog-surveys}
+library(glmmTMB)
+library(DHARMa)
+
+
+
+# STAGE 13: Define bullfrog presence independently of parasite/Bd sampling
+# Stage 6's bullfrog_present was derived from hp_edges; site-year
+# was called "bullfrog absent" whenever RACA didn't show up in the
+# dissection-based interaction table. That conflates "not dissected" with
+# "biologically absent." Rebuilding bullfrog status from the independent
+# netting (survey_spp) and visual-encounter (visual_spp) surveys instead,
+# and leaving status as NA for site-years that were never surveyed for
+# amphibians at all - this supersedes hp_edges_bf from Stage 6 for any
+# confirmatory analysis.
+
+bullfrog_survey_status <- bind_rows(
+
+  survey_spp %>%
+    transmute(
+      site_code,
+      year,
+      survey_id = survey_code,
+      detected = spp_code == "RACA",
+      source = "survey_spp"
+    ),
+
+  visual_spp %>%
+    transmute(
+      site_code = site,
+      year = as.integer(str_sub(as.character(code), 1, 4)),
+      survey_id = visual_code,
+      detected = spp_code == "RACA",
+      source = "visual_spp"
+    )
+
+) %>%
+  filter(
+    !is.na(site_code),
+    !is.na(year)
+  ) %>%
+  group_by(site_code, year) %>%
+  summarize(
+    bullfrog_detected = any(detected),
+    n_surveys = n_distinct(survey_id),
+    survey_sources = paste(sort(unique(source)), collapse = ", "),
+    .groups = "drop"
+  )
+
+bullfrog_survey_status %>%
+  count(bullfrog_detected)
+
+# how many site-years in the network data have NO independent survey
+# coverage at all? these should stay NA, not get forced to FALSE
+hp_edges %>%
+  distinct(site_code, year) %>%
+  left_join(bullfrog_survey_status, by = c("site_code", "year")) %>%
+  summarize(
+    n_site_years = n(),
+    n_unsurveyed = sum(is.na(bullfrog_detected))
+  )
+
+# rebuilt bullfrog-tagged edge table using survey-based status
+hp_edges_bf2 <- hp_edges %>%
+  left_join(bullfrog_survey_status, by = c("site_code", "year"))
+
+hp_edges_bf2 %>%
+  count(bullfrog_detected, useNA = "ifany")
+```
+
+## 3.3 Stage 14 — Check bullfrog–permanence overlap and estimability
+
+**Status:** Core. This is primarily a support/overlap check, not proof that the predictors are unconfounded. Sparse or absent combinations determine whether an interaction can be estimated.
+
+```{r h12-stage-14-overlap}
+# STAGE 14: Test whether bullfrog detection and pond longevity are confounded
+
+analysis_df <- site_year_network_summary %>%
+  select(-any_of(c("bullfrog_present", "bullfrog_detected"))) %>%
+  left_join(bullfrog_survey_status, by = c("site_code", "year")) %>%
+  left_join(env_site_year, by = c("site_code", "year"))
+
+# Site-year support
+analysis_df %>%
+  count(longevity, bullfrog_detected) %>%
+  group_by(longevity) %>%
+  mutate(proportion = n / sum(n))
+
+# Distinct-site support
+analysis_df %>%
+  distinct(site_code, longevity, bullfrog_detected) %>%
+  count(longevity, bullfrog_detected)
+
+# Does habitat predict bullfrog detection?
+m_bullfrog_habitat <- glmmTMB(
+  bullfrog_detected ~
+    longevity +
+    scale(log1p(pond_area_m)) +
+    scale(max_depth_m) +
+    ever_dry +
+    scale(year) +
+    (1 | site_code),
+  family = binomial,
+  data = analysis_df
+)
+
+summary(m_bullfrog_habitat)
+
+# Check origin/class as a more direct anthropogenic-disturbance proxy
+# than longevity alone.
+site_info %>%
+  count(class, origin, longevity)
+
+# flag sparse cells directly rather than eyeballing the proportions table
+driver_support <- analysis_df %>%
+  count(longevity, bullfrog_detected) %>%
+  group_by(longevity) %>%
+  mutate(proportion = n / sum(n))
+
+driver_support %>% filter(n < 5)
+
+# distinct-pond version - a proportion built on the same 2 ponds resurveyed
+# across years isn't real replication, even if the site-year count is high
+pond_support <- analysis_df %>%
+  distinct(site_code, longevity, bullfrog_detected) %>%
+  count(longevity, bullfrog_detected)
+
+pond_support %>% filter(n < 3)
+
+# fallback if the 3-way split is too sparse: collapse to permanent vs.
+# non-permanent. Uses string matching so it doesn't depend on the exact
+# level spelling/capitalization in site_info
+analysis_df <- analysis_df %>%
+  mutate(
+    longevity_binary = if_else(
+      str_detect(str_to_lower(longevity), "perm") &
+        !str_detect(str_to_lower(longevity), "semi"),
+      "permanent",
+      "non-permanent"
+    )
+  )
+
+analysis_df %>%
+  count(longevity_binary, bullfrog_detected) %>%
+  group_by(longevity_binary) %>%
+  mutate(proportion = n / sum(n))
+```
+
+### Retained interpretation
+
+- No significant environmental predictors of bullfrog detection besides year.
+
+
+## 3.4 Stage 15 — Quantify network sampling effort
+
+**Status:** Core. This stage defines the observation process shared by H1 and H2 and supports sensitivity analyses for H3.
+
+```{r h12-stage-15-effort}
+# STAGE 15: Quantify + control network sampling effort (arxiv de aguiar)
+network_effort <- amphib_dissect %>%
+  filter(dissected %in% TRUE) %>%
+  group_by(site_code, year) %>%
+  summarize(
+    total_dissected = n(),
+    host_species_dissected = n_distinct(spp_code),
+    .groups = "drop"
+  )
+
+network_effort
+
+network_df <- analysis_df %>%
+  left_join(network_effort, by = c("site_code", "year"))
+
+network_df %>%
+  summarize(
+    n_missing_effort = sum(is.na(total_dissected)),
+    min_dissected = min(total_dissected, na.rm = TRUE),
+    max_dissected = max(total_dissected, na.rm = TRUE)
+  )
+
+# threshold sensitivity - does the bullfrog/longevity signal hold across
+# minimum-effort cutoffs, rather than resting on one arbitrary threshold?
+effort_sensitivity <- map_dfr(
+  c(5, 10, 20, 30),
+  function(threshold) {
+    network_df %>%
+      filter(total_dissected >= threshold) %>%
+      mutate(minimum_effort = threshold)
+  }
+)
+
+effort_sensitivity %>%
+  count(minimum_effort)
+
+# flag (don't silently drop) unstable/near-degenerate networks
+network_df <- network_df %>%
+  mutate(
+    network_too_small = n_hosts < 2 | n_parasites < 3
+  )
+
+network_df %>%
+  count(network_too_small)
+```
+
+## 3.5 Stage 22 — Shared model-diagnostic helper
+
+**Status:** Core utility. The corrected helper is retained once; the duplicated earlier copy is not repeated.
+
+```{r shared-stage-22-diagnostics}
+
+# STAGE 22: Formal model diagnostics, collinearity, and complete-case
+# reporting for the GLMMs above
+
+library(DHARMa)
+library(tidyverse)
+
+check_model <- function(
+    model,
+    model_name,
+    model_data = NULL,
+    time_var = NULL,
+    group_var = NULL,
+    min_time_points = 4
+) {
+
+  res <- simulateResiduals(
+    fittedModel = model,
+    n = 1000
+  )
+
+  cat("\n---", model_name, "---\n")
+
+  plot(res)
+
+  dispersion_test <- testDispersion(
+    res,
+    plot = FALSE
+  )
+
+  zero_test <- testZeroInflation(
+    res,
+    plot = FALSE
+  )
+
+  uniformity_test <- testUniformity(
+    res,
+    plot = FALSE
+  )
+
+  print(uniformity_test)
+  print(dispersion_test)
+  print(zero_test)
+
+  temporal_overall <- NULL
+  temporal_by_group <- NULL
+
+  if (!is.null(time_var) && !is.null(group_var)) {
+
+    if (length(time_var) != length(res$scaledResiduals) ||
+        length(group_var) != length(res$scaledResiduals)) {
+      stop(
+        "time_var and group_var must correspond exactly to the rows ",
+        "used to fit the model."
+      )
+    }
+
+    # ----------------------------------------------------------
+    # Overall temporal test
+    # Aggregate residuals across sites within each year
+    # ----------------------------------------------------------
+
+    complete_temporal <- !is.na(time_var) & !is.na(group_var)
+
+    res_temporal <- recalculateResiduals(
+      res,
+      sel = complete_temporal
+    )
+
+    time_complete <- time_var[complete_temporal]
+
+    year_factor <- factor(
+      time_complete,
+      levels = sort(unique(time_complete))
+    )
+
+    res_by_year <- recalculateResiduals(
+      res_temporal,
+      group = year_factor
+    )
+
+    temporal_overall <- testTemporalAutocorrelation(
+      res_by_year,
+      time = sort(unique(time_complete)),
+      plot = TRUE
+    )
+
+    cat("\nOverall temporal autocorrelation:\n")
+    print(temporal_overall)
+
+    # ----------------------------------------------------------
+    # Within-site temporal tests
+    # Requires one observation per site-year
+    # ----------------------------------------------------------
+
+    temporal_df <- tibble(
+      row_id = seq_along(time_var),
+      time = time_var,
+      group = as.character(group_var)
+    ) %>%
+      filter(
+        !is.na(time),
+        !is.na(group)
+      )
+
+    repeated_site_years <- temporal_df %>%
+      count(group, time) %>%
+      filter(n > 1)
+
+    if (nrow(repeated_site_years) > 0) {
+
+      warning(
+        "Some groups contain multiple observations in the same year. ",
+        "The within-group temporal tests were skipped. Aggregate to one ",
+        "observation per group-year first."
+      )
+
+    } else {
+
+      temporal_by_group <- temporal_df %>%
+        group_split(group) %>%
+        map_dfr(function(df_group) {
+
+          df_group <- df_group %>%
+            arrange(time)
+
+          group_name <- first(df_group$group)
+
+          if (nrow(df_group) < min_time_points) {
+            return(
+              tibble(
+                group = group_name,
+                n_years = nrow(df_group),
+                statistic = NA_real_,
+                p_value = NA_real_
+              )
+            )
+          }
+
+          keep_rows <- seq_along(time_var) %in% df_group$row_id
+
+          res_group <- recalculateResiduals(
+            res,
+            sel = keep_rows
+          )
+
+          autocorrelation_test <- testTemporalAutocorrelation(
+            res_group,
+            time = df_group$time,
+            plot = FALSE
+          )
+
+          tibble(
+            group = group_name,
+            n_years = nrow(df_group),
+            statistic = unname(
+              autocorrelation_test$statistic
+            ),
+            p_value = autocorrelation_test$p.value
+          )
+        }) %>%
+        mutate(
+          p_adjusted = p.adjust(
+            p_value,
+            method = "BH"
+          )
+        )
+
+      cat("\nWithin-site temporal autocorrelation tests:\n")
+      print(temporal_by_group)
+    }
+  }
+
+  invisible(
+    list(
+      residuals = res,
+      uniformity = uniformity_test,
+      dispersion = dispersion_test,
+      zero_inflation = zero_test,
+      temporal_overall = temporal_overall,
+      temporal_by_group = temporal_by_group
+    )
+  )
+}
+```
+
+## 3.6 Stage 23 — Rebuild parasite richness from the sampling frame
+
+**Status:** Core, unresolved.
+
+This replaces the Stage 16 richness dataset, which was filtered to networks with at least three parasite taxa. The final model must start from all adequately sampled site-years. Before assigning zero richness, confirm that the absence of a parasite record means examination was completed and no parasites were found rather than that parasite records are missing.
+
+```{r h12-stage-23-richness}
+# STAGE 23: Rebuild the parasite-richness dataset correctly
+#
+# The stuck attempt above (and Stage 16's m_richness) built richness_model_df
+# from network_df_model, which is filtered to !network_too_small - i.e.
+# n_parasites >= 3 by construction. That's why richness could never go
+# below 3: the model was fit on data where low richness was already
+# excluded. Rebuilding from the dissection records directly instead, so
+# 0/1/2-richness site-years are actually in the model.
+
+parasite_richness_observed <- hp_edges %>%
+  distinct(site_code, year, parasite_name) %>%
+  count(site_code, year, name = "n_parasites_observed")
+
+richness_df <- network_effort %>%
+  left_join(parasite_richness_observed, by = c("site_code", "year")) %>%
+  mutate(
+    # zero is a legitimate observation here - network_effort only contains
+    # site-years where dissection actually happened, so a site-year with
+    # no match in parasite_richness_observed means examination was
+    # completed and no parasites were found, not "not looked"
+    n_parasites = replace_na(n_parasites_observed, 0)
+  ) %>%
+  select(-n_parasites_observed) %>%
+  left_join(bullfrog_survey_status, by = c("site_code", "year")) %>%
+  left_join(site_info %>% select(site_code, longevity), by = "site_code") %>%
+  filter(!is.na(bullfrog_detected))
+
+# verify the zero-richness assumption before trusting it: does
+# amphib_parasite ever contain an explicit negative record (checked for a
+# parasite, none found), or are only positive detections ever entered?
+amphib_parasite %>%
+  summarize(
+    n_rows = n(),
+    n_zero_count = sum(parasite_cnt == 0, na.rm = TRUE),
+    n_presence_false = sum(presence %in% c(FALSE, "N", "No", "NO", 0), na.rm = TRUE)
+  )
+
+# how many dissected individuals have NO row at all in amphib_parasite -
+# richness_df currently treats every one of these as a confirmed zero
+amphib_dissect %>%
+  distinct(dissect_code) %>%
+  anti_join(amphib_parasite %>% distinct(dissect_code), by = "dissect_code") %>%
+  nrow()
+
+richness_df %>%
+  summarize(
+    n_site_years = n(),
+    min_richness = min(n_parasites),
+    max_richness = max(n_parasites),
+    n_zero = sum(n_parasites == 0),
+    n_one  = sum(n_parasites == 1),
+    n_two  = sum(n_parasites == 2)
+  )
+
+# additive per Stage 15.5's estimability check - not bullfrog_detected * longevity
+m_richness_poisson <- glmmTMB(
+  n_parasites ~
+    bullfrog_detected +
+    longevity +
+    scale(year) +
+    scale(log1p(total_dissected)) +
+    (1 | site_code),
+  family = poisson,
+  data = richness_df,
+  na.action = na.fail
+)
+
+summary(m_richness_poisson)
+
+res_richness_poisson <- simulateResiduals(m_richness_poisson, n = 1000)
+plot(res_richness_poisson)
+testUniformity(res_richness_poisson)
+testDispersion(res_richness_poisson)
+testZeroInflation(res_richness_poisson)
+
+# escalate to COM-Poisson if the Poisson model is underdispersed (a
+# dispersion ratio < 1 with a significant test above) - nbinom2 only
+# corrects overdispersion, so it's the wrong escalation for this case
+m_richness_compois <- update(m_richness_poisson, family = compois)
+
+res_richness_compois <- simulateResiduals(m_richness_compois, n = 1000)
+plot(res_richness_compois)
+testUniformity(res_richness_compois)
+testDispersion(res_richness_compois)
+testZeroInflation(res_richness_compois)
+
+summary(m_richness_compois)
+
+# done when either:
+# (a) one of the two models above has acceptable DHARMa diagnostics - use
+#     it and interpret those coefficients, or
+# (b) neither does - write down that richness cannot currently support a
+#     reliable model instead of reporting a coefficient anyway
+```
+
+### Decision rule for the richness result
+
+- Use the Poisson model only if DHARMa diagnostics are acceptable.
+- Escalate to COM-Poisson for genuine underdispersion.
+- If neither model fits adequately, report that parasite richness cannot currently support reliable inference rather than interpreting an unstable coefficient.
+
+## 3.7 Stage 24 — Validate the connectance model
+
+**Status:** Core, unresolved. This is currently the most promising H1/H2 inferential outcome.
+
+```{r h12-stage-24-connectance}
+# STAGE 24: Validate the connectance model
+#
+# Connectance was more promising than richness in Stage 16 and could
+# become the main H1/H2 result - so it gets the full diagnostic
+# treatment before that claim is trusted.
+
+connectance_df <- network_df %>%
+  filter(
+    !network_too_small,
+    !is.na(bullfrog_detected),
+    !is.na(longevity),
+    !is.na(year),
+    !is.na(total_dissected),
+    !is.na(site_code)
+  ) %>%
+  mutate(possible_links = n_hosts * n_parasites)
+
+nrow(network_df)
+nrow(connectance_df)
+
+# additive per Stage 15.5 - no interaction unless the estimability check
+# there actually supports one
+m_connectance_validated <- glmmTMB(
+  cbind(n_edges, possible_links - n_edges) ~
+    bullfrog_detected +
+    longevity +
+    scale(year) +
+    scale(log1p(total_dissected)) +
+    (1 | site_code),
+  family = betabinomial,
+  data = connectance_df,
+  na.action = na.fail
+)
+
+summary(m_connectance_validated)
+
+# convergence + positive-definite Hessian
+diagnose(m_connectance_validated)
+m_connectance_validated$sdr$pdHess
+
+# DHARMa uniformity, dispersion, zero-inflation, residual-vs-predicted
+check_model(
+  m_connectance_validated,
+  "connectance (validated, additive)",
+  model_data = connectance_df,
+  time_var = connectance_df$year,
+  group_var = connectance_df$site_code
+)
+
+# collinearity - is bullfrog_detected confounded with longevity or effort
+# in this exact complete-case dataset (may differ slightly from Stage 15.5's
+# driver_df due to the na.omit above)
+connectance_df %>%
+  count(longevity, bullfrog_detected) %>%
+  group_by(longevity) %>%
+  mutate(prop = n / sum(n))
+
+connectance_df %>%
+  summarize(cor_year_effort = cor(year, log1p(total_dissected), use = "pairwise.complete.obs"))
+
+# sensitivity to minimum dissection threshold - does the bullfrog_detected
+# coefficient keep its sign as weakly-sampled site-years are dropped?
+connectance_sensitivity <- map_dfr(
+  c(5, 10, 20, 30),
+  function(threshold) {
+
+    df_thresh <- connectance_df %>%
+      filter(total_dissected >= threshold)
+
+    if (n_distinct(df_thresh$bullfrog_detected) < 2 || nrow(df_thresh) < 10) {
+      return(tibble(minimum_effort = threshold, n = nrow(df_thresh), bullfrog_coef = NA_real_))
+    }
+
+    m_thresh <- glmmTMB(
+      cbind(n_edges, possible_links - n_edges) ~
+        bullfrog_detected + longevity + scale(year) + scale(log1p(total_dissected)) +
+        (1 | site_code),
+      family = betabinomial,
+      data = df_thresh
+    )
+
+    tibble(
+      minimum_effort = threshold,
+      n = nrow(df_thresh),
+      bullfrog_coef = fixef(m_thresh)$cond[["bullfrog_detectedTRUE"]]
+    )
+  }
+)
+
+connectance_sensitivity
+```
+
+## 3.8 Stage 17 — Bipartite modularity and null comparison
+
+**Status:** Needs revision.
+
+This replaces Louvain modularity for final biological interpretation. The current pooled bullfrog comparison asks whether each pooled network is unusual relative to its own fixed-margin null model; it does **not** by itself test whether bullfrog-detected and nondetected site-years differ significantly. A replicated site-year modularity or null-standardized modularity model is still needed.
+
+```{r h12-stage-17-modularity}
+# STAGE 17: Recalculate modularity using a bipartite-specific method + null model
+library(bipartite)
+
+compute_bipartite_modularity <- function(edges_df) {
+
+  web <- edges_df %>%
+    distinct(spp_code, parasite_name) %>%
+    mutate(value = 1L) %>%
+    pivot_wider(
+      names_from = parasite_name,
+      values_from = value,
+      values_fill = 0
+    ) %>%
+    column_to_rownames("spp_code") %>%
+    as.matrix()
+
+  observed_modularity <- bipartite::networklevel(
+    web,
+    index = "modularity",
+    weighted = FALSE
+  )
+
+  null_webs <- vegan::permatswap(
+    web,
+    method = "quasiswap",
+    fixedmar = "both",
+    mtype = "prab",
+    times = 999
+  )$perm
+
+  null_modularity <- map_dbl(
+    null_webs,
+    ~ bipartite::networklevel(.x, index = "modularity", weighted = FALSE)
+  )
+
+  tibble(
+    observed_modularity = observed_modularity,
+    null_mean = mean(null_modularity),
+    null_sd = sd(null_modularity),
+    modularity_z = (observed_modularity - mean(null_modularity)) / sd(null_modularity)
+  )
+}
+
+# sanity check against the full metaweb's Louvain modularity from Stage 3-4
+metaweb_modularity <- compute_bipartite_modularity(hp_edges)
+metaweb_modularity
+
+# bullfrog present/absent subsets - replaces Stage 6/9's Louvain-based
+# modularity comparison
+bipartite_modularity_by_bullfrog <- hp_edges_bf2 %>%
+  filter(!is.na(bullfrog_detected)) %>%
+  group_by(bullfrog_detected) %>%
+  group_modify(~ compute_bipartite_modularity(.x)) %>%
+  ungroup()
+
+bipartite_modularity_by_bullfrog
+```
+
+### Retained interpretation
+
+- Original note: “bullfrog presence → significant modularity difference vs null model.”
+
+**Current status:** Revise this claim. The result may show that one or both pooled networks differ from their null expectations, but a direct between-status test is still required.
+
+## 3.9 Current H1/H2 results ledger
+
+| Outcome | Current evidence | Status |
+|---|---|---|
+| Parasite richness | Earlier models suggested higher richness with bullfrogs and some longevity differences | Not interpretable until Stage 23 is resolved |
+| Connectance | Earlier models suggested lower connectance with bullfrogs and longevity differences | Provisional pending Stage 24 diagnostics and sensitivity checks |
+| Modularity | Pooled bipartite null comparisons suggest structural differences | Needs replicated site-year analysis |
+| Bullfrog × longevity interaction | Earlier first-pass model suggested an interaction in some cells | Do not retain unless overlap/support is adequate |
+
+### Original first-pass interpretations retained for provenance
+
+- Bullfrog presence, total dissected, and the RACA/semi-permanent interaction were significant predictors of richness.
+- Semi-permanence and its interaction with bullfrog presence were significant for connectance.
+
+These statements belong to the superseded Stage 16 model and must not be treated as final results.
+
+# 4. H3 — Temporal network dynamics
+
+## 4.1 Descriptive annual dynamics from Stages 4–5
+
+The annual link count, connectance, modularity, and node trajectories above provide descriptive context. Similar aggregate metrics across years do not imply that the same taxa or interactions persisted.
+
+## 4.2 Stage 10 — Host projection and Jaccard similarity
+
+**Status:** Supporting/descriptive. This describes shared parasite assemblages among hosts and motivated the formal beta-diversity analysis. It is not itself a transmission model.
+
+```{r h3-stage-10-host-projection}
+#stage 10
+
+build_host_jaccard_projection <- function(edge_df) {
+  
+  # Binary host x parasite incidence matrix
+  incidence <- edge_df %>%
+    distinct(spp_code, parasite_name) %>%
+    mutate(present = 1L) %>%
+    pivot_wider(
+      names_from = parasite_name,
+      values_from = present,
+      values_fill = 0
+    )
+  
+  host_names <- incidence$spp_code
+  
+  host_matrix <- incidence %>%
+    select(-spp_code) %>%
+    as.matrix()
+  
+  rownames(host_matrix) <- host_names
+  
+  # Jaccard similarity:
+  # shared parasites / total unique parasites across the pair
+  jaccard_matrix <- matrix(
+    NA_real_,
+    nrow = nrow(host_matrix),
+    ncol = nrow(host_matrix),
+    dimnames = list(host_names, host_names)
+  )
+  
+  for (i in seq_len(nrow(host_matrix))) {
+    for (j in seq_len(nrow(host_matrix))) {
+      
+      host_i <- host_matrix[i, ] > 0
+      host_j <- host_matrix[j, ] > 0
+      
+      intersection <- sum(host_i & host_j)
+      union <- sum(host_i | host_j)
+      
+      jaccard_matrix[i, j] <- ifelse(
+        union == 0,
+        NA_real_,
+        intersection / union
+      )
+    }
+  }
+  
+  diag(jaccard_matrix) <- 0
+  
+  # Convert upper triangle to edge table
+  projection_edges <- as.data.frame(as.table(jaccard_matrix)) %>%
+    as_tibble() %>%
+    rename(
+      from = Var1,
+      to = Var2,
+      jaccard = Freq
+    ) %>%
+    mutate(
+      from = as.character(from),
+      to = as.character(to)
+    ) %>%
+    filter(
+      from < to,
+      !is.na(jaccard),
+      jaccard > 0
+    )
+  
+  projection_nodes <- tibble(
+    name = host_names,
+    parasite_richness = rowSums(host_matrix > 0)
+  )
+  
+  g_projection <- graph_from_data_frame(
+    d = projection_edges,
+    vertices = projection_nodes,
+    directed = FALSE
+  )
+  
+  list(
+    graph = g_projection,
+    edges = projection_edges,
+    nodes = projection_nodes,
+    incidence_matrix = host_matrix,
+    jaccard_matrix = jaccard_matrix
+  )
+}
+
+# 2. Pooled host projection
+host_projection <- build_host_jaccard_projection(hp_edges)
+
+g_host_jaccard <- host_projection$graph
+
+host_projection$edges
+host_projection$jaccard_matrix
+
+set.seed(6262026)
+
+ggraph(g_host_jaccard, layout = "fr") +
+  geom_edge_link(
+    aes(
+      width = jaccard,
+      alpha = jaccard
+    ),
+    show.legend = TRUE
+  ) +
+  geom_node_point(
+    aes(size = parasite_richness)
+  ) +
+  geom_node_text(
+    aes(label = name),
+    repel = TRUE
+  ) +
+  scale_edge_width(
+    range = c(0.5, 4),
+    name = "Jaccard similarity"
+  ) +
+  scale_edge_alpha(
+    range = c(0.3, 1),
+    name = "Jaccard similarity"
+  ) +
+  labs(
+    title = "Host projection based on shared parasite assemblages",
+    subtitle = "Edge weights represent Jaccard similarity"
+  ) +
+  theme_void()
+
+
+# 4. Host centrality in projected network
+
+host_projection_centrality <- tibble(
+  spp_code = V(g_host_jaccard)$name,
+  
+  projected_degree = degree(g_host_jaccard),
+  
+  strength = strength(
+    g_host_jaccard,
+    weights = E(g_host_jaccard)$jaccard
+  ),
+  
+  betweenness = betweenness(
+    g_host_jaccard,
+    directed = FALSE,
+    weights = 1 / E(g_host_jaccard)$jaccard,
+    normalized = TRUE
+  ),
+  
+  closeness = closeness(
+    g_host_jaccard,
+    weights = 1 / E(g_host_jaccard)$jaccard,
+    normalized = TRUE
+  ),
+  
+  eigen = eigen_centrality(
+    g_host_jaccard,
+    weights = E(g_host_jaccard)$jaccard
+  )$vector,
+  
+  parasite_richness = V(g_host_jaccard)$parasite_richness
+) %>%
+  arrange(desc(strength))
+
+host_projection_centrality
+
+# 6. Year-specific projected networks
+
+yearly_host_projection_summary <- hp_edges %>%
+  group_split(year) %>%
+  map_dfr(function(df_year) {
+    
+    yr <- unique(df_year$year)
+    
+    projection <- build_host_jaccard_projection(df_year)
+    g <- projection$graph
+    
+    tibble(
+      year = yr,
+      n_hosts = vcount(g),
+      n_host_links = ecount(g),
+      
+      mean_jaccard = ifelse(
+        ecount(g) > 0,
+        mean(E(g)$jaccard),
+        NA_real_
+      ),
+      
+      max_jaccard = ifelse(
+        ecount(g) > 0,
+        max(E(g)$jaccard),
+        NA_real_
+      ),
+      
+      mean_strength = ifelse(
+        vcount(g) > 0,
+        mean(strength(g, weights = E(g)$jaccard)),
+        NA_real_
+      ),
+      
+      density = edge_density(g)
+    )
+  })
+
+yearly_host_projection_summary
+
+# 7. Mean Jaccard similarity through time
+
+yearly_host_projection_summary %>%
+  ggplot(aes(x = year, y = mean_jaccard)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Year",
+    y = "Mean host-pair Jaccard similarity",
+    title = "Host parasite-sharing similarity through time"
+  ) +
+  theme_minimal()
+
+
+# 8. Host-pair similarity trajectories
+yearly_host_pair_similarity <- hp_edges %>%
+  group_split(year) %>%
+  map_dfr(function(df_year) {
+    
+    yr <- unique(df_year$year)
+    
+    projection <- build_host_jaccard_projection(df_year)
+    
+    projection$edges %>%
+      mutate(
+        year = yr,
+        host_pair = paste(from, to, sep = " – ")
+      )
+  })
+
+yearly_host_pair_similarity %>%
+  ggplot(
+    aes(
+      x = year,
+      y = jaccard,
+      group = host_pair,
+      color = host_pair
+    )
+  ) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Year",
+    y = "Jaccard similarity",
+    color = "Host pair",
+    title = "Shared parasite assemblages among host pairs"
+  ) +
+  theme_minimal()
+
+```
+
+
+- strong shared overlap between core cluster of hosts (TATO, PSRE, BUBO), intermediate with RACA-everything (0.55)
+
+- mean jaccard increases over time (evidence of rewiring?)
+
+- 
+
+
+```{r}
+# Highlight host pairs that include RACA
+
+raca_pair_plot_df <- yearly_host_pair_similarity %>%
+  mutate(
+    raca_pair = str_detect(host_pair, "RACA"),
+    raca_pair_label = if_else(
+      raca_pair,
+      host_pair,
+      "Other host pairs"
+    )
+  )
+
+ggplot() +
+  geom_line(
+    data = raca_pair_plot_df %>% filter(!raca_pair),
+    aes(year, jaccard, group = host_pair),
+    color = "gray75",
+    alpha = 0.5,
+    linewidth = 0.7
+  ) +
+  geom_point(
+    data = raca_pair_plot_df %>% filter(!raca_pair),
+    aes(year, jaccard, group = host_pair),
+    color = "gray75",
+    alpha = 0.5,
+    size = 1.5
+  ) +
+  geom_line(
+    data = raca_pair_plot_df %>% filter(raca_pair),
+    aes(year, jaccard, group = host_pair, color = host_pair),
+    linewidth = 1.2
+  ) +
+  geom_point(
+    data = raca_pair_plot_df %>% filter(raca_pair),
+    aes(year, jaccard, color = host_pair),
+    size = 2.5
+  ) +
+  labs(
+    x = "Year",
+    y = "Jaccard similarity",
+    color = "RACA host pair",
+    title = "Parasite assemblage similarity involving RACA through time",
+    subtitle = "Dashed line indicates first observed RACA year"
+  ) +
+  theme_minimal()
+```
+
+### Retained interpretation
+
+- Strong shared overlap between the core cluster of hosts (TATO, PSRE, BUBO), with intermediate similarity involving RACA.
+- Mean Jaccard similarity appeared to increase over time, initially raising the question of rewiring.
+
+**Current status:** The increase in pooled host-pair similarity is descriptive. The within-site beta-diversity decomposition is the stronger test of temporal change.
+
+## 4.3 Stage 13 — Pooled/shared-site temporal beta diversity
+
+**Status:** Supporting sensitivity analysis. This analysis correctly partitions total interaction dissimilarity into rewiring among shared taxa (`beta_os`) and the interaction-level contribution associated with turnover (`beta_st`). Pooled networks can still mix spatial and temporal change.
+
+```{r h3-stage-13-pooled-beta}
+# STAGE 13: Temporal network dissimilarity
+# Rewiring vs. species-turnover contributions
+
+# 1. Clean binary interaction table
+
+hp_edges_beta <- hp_edges |>
+  dplyr::transmute(
+    site_code = as.character(site_code),
+    year = as.integer(year),
+    host = as.character(spp_code),
+    parasite = as.character(parasite_name)
+  ) |>
+  dplyr::filter(
+    !is.na(site_code),
+    !is.na(year),
+    !is.na(host),
+    !is.na(parasite),
+    host != "",
+    parasite != ""
+  ) |>
+  dplyr::distinct(site_code, year, host, parasite)
+
+
+
+# 2. Convert an edge table to a binary incidence matrix
+
+
+edges_to_matrix <- function(edges, hosts, parasites) {
+
+  web <- matrix(
+    0L,
+    nrow = length(hosts),
+    ncol = length(parasites),
+    dimnames = list(hosts, parasites)
+  )
+
+  if (nrow(edges) > 0) {
+
+    row_id <- match(edges$host, hosts)
+    col_id <- match(edges$parasite, parasites)
+
+    web[cbind(row_id, col_id)] <- 1L
+  }
+
+  web
+}
+
+
+
+# 3. Compare two networks
+#
+# βS  = taxonomic composition dissimilarity
+# βWN = total interaction-network dissimilarity
+# βOS = contribution from rewiring among shared taxa
+# βST = contribution from taxa not shared between networks
+#
+# Under partitioning = "commondenom":
+# βWN = βOS + βST
+
+
+network_beta <- function(edges_a, edges_b) {
+
+  edges_a <- edges_a |>
+    dplyr::distinct(host, parasite)
+
+  edges_b <- edges_b |>
+    dplyr::distinct(host, parasite)
+
+  # Return missing results if either network has no interactions
+  if (nrow(edges_a) == 0 || nrow(edges_b) == 0) {
+
+    return(
+      tibble::tibble(
+        beta_s = NA_real_,
+        beta_os = NA_real_,
+        beta_st = NA_real_,
+        beta_wn = NA_real_,
+        rewiring_fraction = NA_real_,
+        turnover_fraction = NA_real_,
+        decomposition_error = NA_real_,
+        n_hosts_a = dplyr::n_distinct(edges_a$host),
+        n_hosts_b = dplyr::n_distinct(edges_b$host),
+        n_shared_hosts = length(
+          intersect(unique(edges_a$host), unique(edges_b$host))
+        ),
+        n_parasites_a = dplyr::n_distinct(edges_a$parasite),
+        n_parasites_b = dplyr::n_distinct(edges_b$parasite),
+        n_shared_parasites = length(
+          intersect(unique(edges_a$parasite), unique(edges_b$parasite))
+        ),
+        n_links_a = nrow(edges_a),
+        n_links_b = nrow(edges_b),
+        n_shared_links = 0L
+      )
+    )
+  }
+
+  # Use the same matrix dimensions for both networks
+  all_hosts <- sort(
+    union(unique(edges_a$host), unique(edges_b$host))
+  )
+
+  all_parasites <- sort(
+    union(unique(edges_a$parasite), unique(edges_b$parasite))
+  )
+
+  web_a <- edges_to_matrix(
+    edges = edges_a,
+    hosts = all_hosts,
+    parasites = all_parasites
+  )
+
+  web_b <- edges_to_matrix(
+    edges = edges_b,
+    hosts = all_hosts,
+    parasites = all_parasites
+  )
+
+  web_array <- array(
+    0L,
+    dim = c(
+      length(all_hosts),
+      length(all_parasites),
+      2
+    ),
+    dimnames = list(
+      host = all_hosts,
+      parasite = all_parasites,
+      network = c("A", "B")
+    )
+  )
+
+  web_array[, , "A"] <- web_a
+  web_array[, , "B"] <- web_b
+
+  beta <- bipartite::betalinkr(
+    webarray = web_array,
+    index = "jaccard",
+    binary = TRUE,
+    partitioning = "commondenom",
+    proportions = FALSE,
+    distofempty = "zero"
+  )
+
+  beta_s <- unname(beta["S"])
+  beta_os <- unname(beta["OS"])
+  beta_st <- unname(beta["ST"])
+  beta_wn <- unname(beta["WN"])
+
+  links_a <- paste(edges_a$host, edges_a$parasite, sep = "__")
+  links_b <- paste(edges_b$host, edges_b$parasite, sep = "__")
+
+  tibble::tibble(
+    # Taxonomic dissimilarity; informative but not an additive component
+    beta_s = beta_s,
+
+    # Additive interaction-network components
+    beta_os = beta_os,
+    beta_st = beta_st,
+    beta_wn = beta_wn,
+
+    # Relative contribution to total network dissimilarity
+    rewiring_fraction = dplyr::if_else(
+      beta_wn > 0,
+      beta_os / beta_wn,
+      NA_real_
+    ),
+
+    turnover_fraction = dplyr::if_else(
+      beta_wn > 0,
+      beta_st / beta_wn,
+      NA_real_
+    ),
+
+    # Should be approximately zero
+    decomposition_error = beta_wn - beta_os - beta_st,
+
+    # Diagnostic information
+    n_hosts_a = dplyr::n_distinct(edges_a$host),
+    n_hosts_b = dplyr::n_distinct(edges_b$host),
+
+    n_shared_hosts = length(
+      intersect(unique(edges_a$host), unique(edges_b$host))
+    ),
+
+    n_parasites_a = dplyr::n_distinct(edges_a$parasite),
+    n_parasites_b = dplyr::n_distinct(edges_b$parasite),
+
+    n_shared_parasites = length(
+      intersect(
+        unique(edges_a$parasite),
+        unique(edges_b$parasite)
+      )
+    ),
+
+    n_links_a = nrow(edges_a),
+    n_links_b = nrow(edges_b),
+
+    n_shared_links = length(
+      intersect(links_a, links_b)
+    )
+  )
+}
+
+
+
+# 4. Compare a pair of years
+#
+# shared_sites_only = TRUE prevents changing site composition
+# from being counted as temporal network change.
+
+
+compare_year_pair <- function(
+    edge_data,
+    year_from,
+    year_to,
+    shared_sites_only = TRUE
+) {
+
+  edges_from_raw <- edge_data |>
+    dplyr::filter(year == year_from)
+
+  edges_to_raw <- edge_data |>
+    dplyr::filter(year == year_to)
+
+  sites_from <- unique(edges_from_raw$site_code)
+  sites_to <- unique(edges_to_raw$site_code)
+  shared_sites <- intersect(sites_from, sites_to)
+
+  if (shared_sites_only) {
+
+    edges_from <- edges_from_raw |>
+      dplyr::filter(site_code %in% shared_sites)
+
+    edges_to <- edges_to_raw |>
+      dplyr::filter(site_code %in% shared_sites)
+
+  } else {
+
+    edges_from <- edges_from_raw
+    edges_to <- edges_to_raw
+  }
+
+  network_beta(edges_from, edges_to) |>
+    dplyr::mutate(
+      year_from = year_from,
+      year_to = year_to,
+      year_gap = year_to - year_from,
+      is_adjacent_year = year_gap == 1,
+      comparison = paste(year_from, year_to, sep = "\u2013"),
+      shared_sites_only = shared_sites_only,
+      n_sites_from = length(sites_from),
+      n_sites_to = length(sites_to),
+      n_shared_sites = length(shared_sites),
+      .before = 1
+    )
+}
+
+
+
+# 5. Create observed-year transition table
+
+
+years_sorted <- hp_edges_beta |>
+  dplyr::distinct(year) |>
+  dplyr::arrange(year) |>
+  dplyr::pull(year)
+
+observed_year_transitions <- tibble::tibble(
+  year_from = head(years_sorted, -1),
+  year_to = tail(years_sorted, -1)
+) |>
+  dplyr::mutate(
+    year_gap = year_to - year_from,
+    is_adjacent_year = year_gap == 1
+  )
+
+observed_year_transitions
+
+
+# 6. Consecutive observed networks restricted to shared sites
+
+
+yearly_rewiring_shared_sites <- purrr::map2_dfr(
+  observed_year_transitions$year_from,
+  observed_year_transitions$year_to,
+  ~ compare_year_pair(
+    edge_data = hp_edges_beta,
+    year_from = .x,
+    year_to = .y,
+    shared_sites_only = TRUE
+  )
+)
+
+yearly_rewiring_shared_sites
+
+yearly_rewiring <- yearly_rewiring_shared_sites |>
+  dplyr::filter(is_adjacent_year)
+
+yearly_rewiring
+
+# Keep nonannual comparisons visible but separate (to account for 2009 - 2013 gap)
+gap_comparisons <- yearly_rewiring_shared_sites |>
+  dplyr::filter(!is_adjacent_year)
+
+gap_comparisons
+
+yearly_rewiring |>
+  dplyr::select(
+    comparison,
+    beta_wn,
+    beta_os,
+    beta_st,
+    decomposition_error #should be 0
+  )
+
+
+yearly_rewiring |>
+  dplyr::select(
+    year_from,
+    year_to,
+    comparison,
+    beta_wn,
+    beta_os,
+    beta_st
+  ) |>
+  tidyr::pivot_longer(
+    cols = c(beta_wn, beta_os, beta_st),
+    names_to = "component",
+    values_to = "dissimilarity"
+  ) |>
+  dplyr::mutate(
+    component = dplyr::recode(
+      component,
+      beta_wn = "Total network dissimilarity (\u03b2WN)",
+      beta_os = "Rewiring contribution (\u03b2OS)",
+      beta_st = "Species-turnover contribution (\u03b2ST)"
+    )
+  ) |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = year_to,
+      y = dissimilarity,
+      group = component,
+      color = component
+    )
+  ) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::geom_point(size = 2.5) +
+  ggplot2::labs(
+    x = "Ending year",
+    y = "Jaccard dissimilarity component",
+    color = NULL,
+    title = "Annual host\u2013parasite network change",
+    subtitle = paste(
+      "Comparisons restricted to ponds sampled in both years;",
+      "\u03b2WN = \u03b2OS + \u03b2ST"
+    )
+  ) +
+  ggplot2::theme_minimal()
+
+yearly_rewiring |>
+  dplyr::select(
+    year_to,
+    rewiring_fraction,
+    turnover_fraction
+  ) |>
+  tidyr::pivot_longer(
+    cols = c(rewiring_fraction, turnover_fraction),
+    names_to = "process",
+    values_to = "fraction"
+  ) |>
+  dplyr::mutate(
+    process = dplyr::recode(
+      process,
+      rewiring_fraction = "Rewiring",
+      turnover_fraction = "Species turnover"
+    )
+  ) |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = year_to,
+      y = fraction,
+      group = process,
+      color = process
+    )
+  ) +
+  ggplot2::geom_hline(
+    yintercept = 0.5,
+    linetype = "dashed"
+  ) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::geom_point(size = 2.5) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent
+  ) +
+  ggplot2::labs(
+    x = "Ending year",
+    y = "Contribution to total dissimilarity",
+    color = NULL,
+    title = "Relative contributions of rewiring and species turnover"
+  ) +
+  ggplot2::theme_minimal()
+
+yearly_rewiring_all_sites <- purrr::map2_dfr(
+  observed_year_transitions$year_from,
+  observed_year_transitions$year_to,
+  ~ compare_year_pair(
+    edge_data = hp_edges_beta,
+    year_from = .x,
+    year_to = .y,
+    shared_sites_only = FALSE
+  )
+)
+
+yearly_rewiring_all_sites
+
+rewiring_scope_comparison <- yearly_rewiring_shared_sites |>
+  dplyr::select(
+    year_from,
+    year_to,
+    beta_wn_shared = beta_wn,
+    beta_os_shared = beta_os,
+    beta_st_shared = beta_st
+  ) |>
+  dplyr::left_join(
+    yearly_rewiring_all_sites |>
+      dplyr::select(
+        year_from,
+        year_to,
+        beta_wn_all = beta_wn,
+        beta_os_all = beta_os,
+        beta_st_all = beta_st
+      ),
+    by = c("year_from", "year_to")
+  )
+
+rewiring_scope_comparison
+
+
+# 7. All possible year pairs
+
+all_year_pairs <- combn(
+  years_sorted,
+  2,
+  simplify = FALSE
+)
+
+pairwise_year_table <- purrr::map_dfr(
+  all_year_pairs,
+  ~ tibble::tibble(
+    year_from = .x[1],
+    year_to = .x[2],
+    year_gap = .x[2] - .x[1]
+  )
+)
+
+pairwise_rewiring <- purrr::map2_dfr(
+  pairwise_year_table$year_from,
+  pairwise_year_table$year_to,
+  ~ compare_year_pair(
+    edge_data = hp_edges_beta,
+    year_from = .x,
+    year_to = .y,
+    shared_sites_only = TRUE
+  )
+)
+
+pairwise_rewiring
+
+ggplot2::ggplot(
+  pairwise_rewiring,
+  ggplot2::aes(
+    x = factor(year_from),
+    y = factor(year_to),
+    fill = beta_wn
+  )
+) +
+  ggplot2::geom_tile() +
+  ggplot2::labs(
+    x = "Earlier year",
+    y = "Later year",
+    fill = "\u03b2WN",
+    title = "Pairwise host\u2013parasite network dissimilarity",
+    subtitle = "Comparisons restricted to sites represented in both years"
+  ) +
+  ggplot2::theme_minimal()
+
+# 8. Compare each pond with itself across adjacent years
+
+site_level_rewiring <- purrr::map2_dfr(
+  observed_year_transitions$year_from,
+  observed_year_transitions$year_to,
+  function(yr1, yr2) {
+
+    gap <- yr2 - yr1
+
+    sites_1 <- hp_edges_beta |>
+      dplyr::filter(year == yr1) |>
+      dplyr::distinct(site_code) |>
+      dplyr::pull(site_code)
+
+    sites_2 <- hp_edges_beta |>
+      dplyr::filter(year == yr2) |>
+      dplyr::distinct(site_code) |>
+      dplyr::pull(site_code)
+
+    shared_sites <- intersect(sites_1, sites_2)
+
+    purrr::map_dfr(
+      shared_sites,
+      function(site_i) {
+
+        edges_1 <- hp_edges_beta |>
+          dplyr::filter(
+            site_code == site_i,
+            year == yr1
+          )
+
+        edges_2 <- hp_edges_beta |>
+          dplyr::filter(
+            site_code == site_i,
+            year == yr2
+          )
+
+        network_beta(edges_1, edges_2) |>
+          dplyr::mutate(
+            site_code = site_i,
+            year_from = yr1,
+            year_to = yr2,
+            year_gap = gap,
+            is_adjacent_year = gap == 1,
+            .before = 1
+          )
+      }
+    )
+  }
+)
+
+site_level_rewiring
+
+#flags extremely small networks rather than silently treating them as equally reliable
+minimum_links <- 3L
+
+site_level_rewiring <- site_level_rewiring |>
+  dplyr::mutate(
+    adequate_network_size =
+      n_links_a >= minimum_links &
+      n_links_b >= minimum_links
+  )
+
+site_level_rewiring |>
+  dplyr::count(adequate_network_size)
+
+#summary across ponds
+site_level_rewiring_summary <- site_level_rewiring |>
+  dplyr::filter(
+    is_adjacent_year,
+    adequate_network_size,
+    !is.na(beta_wn)
+  ) |>
+  dplyr::group_by(year_from, year_to) |>
+  dplyr::summarize(
+    n_sites = dplyr::n(),
+
+    mean_beta_wn = mean(beta_wn),
+    mean_beta_os = mean(beta_os),
+    mean_beta_st = mean(beta_st),
+
+    median_beta_wn = median(beta_wn),
+    median_beta_os = median(beta_os),
+    median_beta_st = median(beta_st),
+
+    mean_rewiring_fraction =
+      mean(rewiring_fraction, na.rm = TRUE),
+
+    .groups = "drop"
+  )
+
+site_level_rewiring_summary
+
+```
+
+### Retained interpretation from the pooled analysis
+
+- Network composition was temporally dynamic even when comparisons were limited to the same ponds.
+- Interaction rewiring appeared to be a major component of temporal network variation.
+
+**Current status:** The second claim is superseded as the main conclusion by Stage 20. It remains useful as evidence that spatial aggregation changes the apparent decomposition.
+
+## 4.4 Stage 20 — Within-site turnover versus rewiring
+
+**Status:** Core. This is the primary H3 analysis because each pond is compared with itself across adjacent years. The bootstrap must compare `beta_os` with `beta_st`, not raw taxonomic dissimilarity `beta_s`.
+
+```{r h3-stage-20-within-site}
+# STAGE 20: Strengthen the rewiring decomposition from stage 12
+
+# within-site, year-to-year comparisons only - pooling all sites can make
+# species turnover look like rewiring
+
+within_site_rewiring <- hp_edges %>%
+  transmute(
+    site_code,
+    year = as.integer(year),
+    host = as.character(spp_code),
+    parasite = as.character(parasite_name)
+  ) %>%
+  filter(
+    !is.na(site_code),
+    !is.na(year),
+    !is.na(host),
+    !is.na(parasite)
+  ) %>%
+  distinct(site_code, year, host, parasite) %>%
+  group_by(site_code) %>%
+  group_modify(function(df_site, keys) {
+
+    yrs <- sort(unique(df_site$year))
+
+    if (length(yrs) < 2) {
+      return(tibble())
+    }
+
+    map_dfr(
+      seq_len(length(yrs) - 1),
+      function(i) {
+
+        yr1 <- yrs[i]
+        yr2 <- yrs[i + 1]
+
+        # Compare only adjacent calendar years
+        if (yr2 - yr1 != 1) {
+          return(tibble())
+        }
+
+        e1 <- df_site %>%
+          filter(year == yr1) %>%
+          select(host, parasite)
+
+        e2 <- df_site %>%
+          filter(year == yr2) %>%
+          select(host, parasite)
+
+        shared_hosts <- intersect(
+          unique(e1$host),
+          unique(e2$host)
+        )
+
+        shared_parasites <- intersect(
+          unique(e1$parasite),
+          unique(e2$parasite)
+        )
+
+        # Minimum requirements for estimating rewiring
+        if (
+          nrow(e1) < 3 ||
+          nrow(e2) < 3 ||
+          length(shared_hosts) < 2 ||
+          length(shared_parasites) < 2
+        ) {
+          return(tibble())
+        }
+
+        network_beta(e1, e2) %>%
+          mutate(
+            year_from = yr1,
+            year_to = yr2,
+            year_gap = yr2 - yr1,
+            n_shared_hosts_check = length(shared_hosts),
+            n_shared_parasites_check = length(shared_parasites),
+            .before = 1
+          )
+      }
+    )
+  }) %>%
+  ungroup()
+
+within_site_rewiring
+
+# bootstrap CIs for the annual rewiring fraction (beta_os), resampling
+# sites with replacement
+set.seed(6262026)
+
+boot_rewiring <- map_dfr(
+  1:1000,
+  function(b) {
+
+    boot_sites <- sample(
+      unique(within_site_rewiring$site_code),
+      replace = TRUE
+    )
+
+    boot_df <- map_dfr(boot_sites, function(s) {
+      within_site_rewiring %>% filter(site_code == s)
+    })
+
+    boot_df %>%
+      group_by(year_to) %>%
+      summarize(
+        mean_beta_os = mean(beta_os, na.rm = TRUE),
+        mean_beta_st = mean(beta_st, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(boot_id = b)
+  }
+)
+
+rewiring_ci <- boot_rewiring %>%
+  group_by(year_to) %>%
+  summarize(
+    beta_os_mean  = mean(mean_beta_os, na.rm = TRUE),
+    beta_os_lower = quantile(mean_beta_os, 0.025, na.rm = TRUE),
+    beta_os_upper = quantile(mean_beta_os, 0.975, na.rm = TRUE),
+    beta_st_mean   = mean(mean_beta_st, na.rm = TRUE),
+    beta_st_lower  = quantile(mean_beta_st, 0.025, na.rm = TRUE),
+    beta_st_upper  = quantile(mean_beta_st, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+rewiring_ci
+
+ggplot(rewiring_ci, aes(x = year_to)) +
+  geom_ribbon(aes(ymin = beta_os_lower, ymax = beta_os_upper), alpha = 0.2, fill = "steelblue") +
+  geom_line(aes(y = beta_os_mean), color = "steelblue", linewidth = 1) +
+  geom_ribbon(aes(ymin = beta_st_lower, ymax = beta_st_upper), alpha = 0.2, fill = "darkorange") +
+  geom_line(aes(y = beta_st_mean), color = "darkorange", linewidth = 1) +
+  labs(
+    x = "Year",
+    y = "Dissimilarity (bootstrapped mean +/- 95% CI)",
+    title = "Within-site rewiring (blue) vs. species turnover (orange), bootstrapped over sites"
+  ) +
+  theme_minimal()
+
+# RACA first-detection event study - compares network change before/after
+# first bullfrog detection at invaded ponds, with never-detected ponds as
+# a comparison group, instead of pooling all bullfrog-present site-years
+raca_first_detection <- bullfrog_survey_status %>%
+  filter(bullfrog_detected) %>%
+  group_by(site_code) %>%
+  summarize(first_raca_year = min(year), .groups = "drop")
+
+event_study_df <- site_year_network_summary %>%
+  left_join(raca_first_detection, by = "site_code") %>%
+  mutate(
+    event_time = year - first_raca_year,
+    ever_invaded = !is.na(first_raca_year)
+  )
+
+event_study_df
+
+event_study_df %>%
+  filter(ever_invaded, !is.na(event_time), abs(event_time) <= 5) %>%
+  group_by(event_time) %>%
+  summarize(
+    mean_connectance = mean(connectance, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = event_time, y = mean_connectance)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_line() +
+  geom_point(aes(size = n)) +
+  labs(
+    x = "Years relative to first bullfrog detection",
+    y = "Mean connectance",
+    size = "n site-years",
+    title = "Connectance before/after first bullfrog detection, invaded ponds"
+  ) +
+  theme_minimal()
+```
+
+### Current interpretation
+
+- Within the same pond across years, the species-turnover contribution was substantially larger than the rewiring contribution, approximately threefold in the preliminary summary.
+- Change may therefore arise mainly from hosts or parasites entering or leaving the observed network rather than persistent taxa changing partners.
+- The rewiring signal became smaller when ponds were compared with themselves, showing that pooled analyses can inflate apparent rewiring.
+- The first-detection connectance plot showed a spike near event time zero but did not corroborate a simple post-detection decline; it remains exploratory because first detection is not the same as colonization.
+
+### H3 claim currently supported
+
+> Within-pond annual network change appears to be driven more by the turnover of observed taxa than by interaction rewiring among taxa shared between years, although unequal detection and sampling effort remain alternative explanations.
+
+## 4.5 Planned H3 extensions
+
+**Status:** Future work; no completed result yet.
+
+- Partition networks by host life stage after checking stage-specific sampling and whether reproduction changes the observed composition.
+- Compare drought and nondrought years using a clearly defined external drought classification.
+- Examine seasonal differences in dominant hosts and parasites only if sampling dates provide enough repeated seasonal coverage.
+- Repeat the within-site decomposition across dissection-effort thresholds or individual-level standardization.
+
+```{r}
+# drought vs. non-drought site-years, using the ever_dry classification
+# Check that environmental data have one row per site-year
+env_site_year |>
+  dplyr::count(site_code, year) |>
+  dplyr::filter(n > 1)
+
+# Site-year drought classification
+drought_site_years <- env_site_year |>
+  dplyr::filter(!is.na(ever_dry)) |>
+  dplyr::select(site_code, year, ever_dry) |>
+  dplyr::distinct()
+
+# Join drought status and rename edge columns to match network_beta()
+hp_edges_drought <- hp_edges |>
+  # Prevent ever_dry.x / ever_dry.y if hp_edges already contains this field
+  dplyr::select(-dplyr::any_of("ever_dry")) |>
+  dplyr::inner_join(
+    drought_site_years,
+    by = c("site_code", "year")
+  ) |>
+  dplyr::transmute(
+    site_code = as.character(site_code),
+    year = as.integer(year),
+    host = as.character(spp_code),
+    parasite = as.character(parasite_name),
+    ever_dry = as.logical(ever_dry)
+  ) |>
+  dplyr::filter(
+    !is.na(host),
+    !is.na(parasite),
+    host != "",
+    parasite != ""
+  ) |>
+  dplyr::distinct(
+    site_code,
+    year,
+    host,
+    parasite,
+    ever_dry
+  )
+
+# Check sample sizes before comparison
+hp_edges_drought |>
+  dplyr::summarize(
+    n_site_years = dplyr::n_distinct(
+      interaction(site_code, year)
+    ),
+    .by = ever_dry
+  )
+
+hp_edges_drought |>
+  dplyr::count(ever_dry)
+
+# Pool interactions by drought classification
+edges_dry <- hp_edges_drought |>
+  dplyr::filter(ever_dry == TRUE) |>
+  dplyr::select(host, parasite)
+
+edges_wet <- hp_edges_drought |>
+  dplyr::filter(ever_dry == FALSE) |>
+  dplyr::select(host, parasite)
+
+# Confirm both networks contain interactions
+tibble::tibble(
+  network = c("dry", "wet"),
+  n_links = c(
+    nrow(dplyr::distinct(edges_dry)),
+    nrow(dplyr::distinct(edges_wet))
+  ),
+  n_hosts = c(
+    dplyr::n_distinct(edges_dry$host),
+    dplyr::n_distinct(edges_wet$host)
+  ),
+  n_parasites = c(
+    dplyr::n_distinct(edges_dry$parasite),
+    dplyr::n_distinct(edges_wet$parasite)
+  )
+)
+
+drought_beta <- network_beta(
+  edges_a = edges_dry,
+  edges_b = edges_wet
+)
+
+drought_beta
+```
+- low rewiring/high turnover implies dry network is just a reduced subset of the wet network 
+
+must check whether the same turnover-dominated pattern appears when comparing the same ponds between dry and nondry years
+
+
+### big dog parasites
+
+```{r}
+# Create one clean date record per dissection
+dissection_dates <- dissect_clean |>
+  dplyr::transmute(
+    dissect_code = as.character(dissect_code),
+    collect_date = lubridate::ymd(as.character(collect_date))
+  ) |>
+  dplyr::filter(
+    !is.na(dissect_code),
+    !is.na(collect_date)
+  ) |>
+  dplyr::distinct(dissect_code, collect_date)
+
+dissection_dates |>
+  dplyr::count(dissect_code) |>
+  dplyr::filter(n > 1)
+
+
+# check whether there's enough within-year date spread to say anything about "season" before building any seasonal breakdown
+dissect_clean %>%
+  mutate(month = month(collect_date)) %>%
+  count(year, month) %>%
+  arrange(year, month)
+
+hp_binary_month <- hp_binary |>
+  # Prevent collect_date.x / collect_date.y after the join
+  dplyr::select(
+    -dplyr::any_of(c("collect_date", "month"))
+  ) |>
+  dplyr::mutate(
+    dissect_code = as.character(dissect_code)
+  ) |>
+  dplyr::left_join(
+    dissection_dates,
+    by = "dissect_code"
+  ) |>
+  dplyr::mutate(
+    year = lubridate::year(collect_date),
+    month = lubridate::month(collect_date),
+    month_name = factor(
+      month.abb[month],
+      levels = month.abb,
+      ordered = TRUE
+    )
+  )
+
+hp_binary_month |>
+  dplyr::summarize(
+    n_rows = dplyr::n(),
+    missing_dates = sum(is.na(collect_date)),
+    percent_missing = 100 * mean(is.na(collect_date))
+  )
+
+dominant_taxa_by_month <- hp_binary_month |>
+  dplyr::filter(
+    interaction == 1,
+    !is.na(month),
+    !is.na(parasite_name)
+  ) |>
+  dplyr::count(
+    month,
+    month_name,
+    parasite_name,
+    sort = TRUE
+  ) |>
+  dplyr::group_by(month, month_name) |>
+  dplyr::slice_max(
+    order_by = n,
+    n = 3,
+    with_ties = FALSE
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::arrange(month, dplyr::desc(n))
+
+dominant_taxa_by_month
+```
+
+- standard by sampling effort 
+
+### life stage partition
+
+```{r}
+LIFE_STAGE_COL <- "stage"
+
+# Standardize stage labels and rename columns for network_beta()
+
+stage_edges <- hp_edges_by_stage |>
+  dplyr::transmute(
+    life_stage = stringr::str_to_upper(
+      stringr::str_trim(as.character(life_stage))
+    ),
+    host = as.character(spp_code),
+    parasite = as.character(parasite_name)
+  ) |>
+  dplyr::filter(
+    !is.na(life_stage),
+    !is.na(host),
+    !is.na(parasite),
+    life_stage != "",
+    host != "",
+    parasite != ""
+  ) |>
+  dplyr::distinct(
+    life_stage,
+    host,
+    parasite
+  )
+ 
+meta_edges <- stage_edges |>
+  dplyr::filter(life_stage == "META") |>
+  dplyr::select(host, parasite)
+
+larva_edges <- stage_edges |>
+  dplyr::filter(life_stage == "LARVA") |>
+  dplyr::select(host, parasite)
+
+meta_larva_beta <- network_beta(
+  edges_a = meta_edges,
+  edges_b = larva_edges
+)
+
+meta_larva_beta
+
+stages_to_compare <- c(
+  "ADULT",
+  "LARVA",
+  "META"
+)
+
+# Retain only stages that actually occur in the data
+stages_available <- intersect(
+  stages_to_compare,
+  unique(stage_edges$life_stage)
+)
+
+stage_pairs <- utils::combn(
+  stages_available,
+  2,
+  simplify = FALSE
+)
+
+stage_beta_pairwise <- purrr::map_dfr(
+  stage_pairs,
+  function(stage_pair) {
+
+    stage_a <- stage_pair[1]
+    stage_b <- stage_pair[2]
+
+    edges_a <- stage_edges |>
+      dplyr::filter(life_stage == stage_a) |>
+      dplyr::select(host, parasite)
+
+    edges_b <- stage_edges |>
+      dplyr::filter(life_stage == stage_b) |>
+      dplyr::select(host, parasite)
+
+    network_beta(
+      edges_a = edges_a,
+      edges_b = edges_b
+    ) |>
+      dplyr::mutate(
+        stage_a = stage_a,
+        stage_b = stage_b,
+        comparison = paste(stage_a, stage_b, sep = " vs. "),
+        .before = 1
+      )
+  }
+)
+
+stage_beta_pairwise
+```
+
+
+- compare inter vs intra turnover/rewiring
+
+###pairwise viz
+
+```{r}
+comparison_order <- c(
+  "ADULT vs. LARVA",
+  "ADULT vs. META",
+  "LARVA vs. META"
+)
+
+stage_beta_pairwise_plot <- stage_beta_pairwise |>
+  dplyr::mutate(
+    comparison = factor(
+      comparison,
+      levels = comparison_order
+    )
+  )
+
+stage_component_data <- stage_beta_pairwise_plot |>
+  dplyr::select(
+    comparison,
+    beta_wn,
+    beta_os,
+    beta_st
+  ) |>
+  tidyr::pivot_longer(
+    cols = c(beta_os, beta_st),
+    names_to = "component",
+    values_to = "dissimilarity"
+  ) |>
+  dplyr::mutate(
+    component = dplyr::recode(
+      component,
+      beta_os = "Rewiring among shared taxa",
+      beta_st = "Taxon-turnover contribution"
+    )
+  )
+
+p_stage_components <- ggplot2::ggplot(
+  stage_component_data,
+  ggplot2::aes(
+    x = comparison,
+    y = dissimilarity,
+    fill = component
+  )
+) +
+  ggplot2::geom_col(
+    width = 0.7
+  ) +
+  ggplot2::geom_text(
+    data = stage_beta_pairwise_plot,
+    mapping = ggplot2::aes(
+      x = comparison,
+      y = beta_wn,
+      label = sprintf("\u03b2WN = %.2f", beta_wn)
+    ),
+    inherit.aes = FALSE,
+    vjust = -0.5,
+    size = 3.5
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.2),
+    expand = ggplot2::expansion(
+      mult = c(0, 0.08)
+    )
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Jaccard dissimilarity",
+    fill = NULL,
+    title = "A. Life-stage network dissimilarity",
+    subtitle = "\u03b2WN = \u03b2OS + \u03b2ST"
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 20,
+      hjust = 1
+    ),
+    legend.position = "bottom"
+  )
+
+
+stage_fraction_data <- stage_beta_pairwise_plot |>
+  dplyr::select(
+    comparison,
+    rewiring_fraction,
+    turnover_fraction
+  ) |>
+  tidyr::pivot_longer(
+    cols = c(
+      rewiring_fraction,
+      turnover_fraction
+    ),
+    names_to = "process",
+    values_to = "fraction"
+  ) |>
+  dplyr::mutate(
+    process = dplyr::recode(
+      process,
+      rewiring_fraction = "Rewiring",
+      turnover_fraction = "Taxon turnover"
+    )
+  )
+
+p_stage_fractions <- ggplot2::ggplot(
+  stage_fraction_data,
+  ggplot2::aes(
+    x = comparison,
+    y = fraction,
+    fill = process
+  )
+) +
+  ggplot2::geom_col(
+    width = 0.7
+  ) +
+  ggplot2::geom_hline(
+    yintercept = 0.5,
+    linetype = "dashed"
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent_format(
+      accuracy = 1
+    )
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Contribution to total dissimilarity",
+    fill = NULL,
+    title = "B. Relative contributions to network change"
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 20,
+      hjust = 1
+    ),
+    legend.position = "bottom"
+  )
+
+stage_overall_data <- stage_beta_pairwise_plot |>
+  dplyr::select(
+    comparison,
+    beta_s,
+    beta_wn
+  ) |>
+  tidyr::pivot_longer(
+    cols = c(beta_s, beta_wn),
+    names_to = "metric",
+    values_to = "dissimilarity"
+  ) |>
+  dplyr::mutate(
+    metric = dplyr::recode(
+      metric,
+      beta_s = "Taxonomic dissimilarity (\u03b2S)",
+      beta_wn = "Interaction-network dissimilarity (\u03b2WN)"
+    )
+  )
+
+p_stage_overall <- ggplot2::ggplot(
+  stage_overall_data,
+  ggplot2::aes(
+    x = comparison,
+    y = dissimilarity,
+    group = metric,
+    shape = metric
+  )
+) +
+  ggplot2::geom_point(
+    size = 3
+  ) +
+  ggplot2::geom_line() +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1)
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Jaccard dissimilarity",
+    shape = NULL,
+    title = "C. Taxonomic and interaction dissimilarity",
+    subtitle = "\u03b2S is shown separately because it is not part of the additive partition"
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 20,
+      hjust = 1
+    ),
+    legend.position = "bottom"
+  )
+
+```
+
+
+# 5. Exploratory Bd branch
+
+Bd is retained because the analyses are methodologically informative, but it is not currently integrated tightly enough with H1–H3 to serve as a main paper pillar.
+
+## 5.1 Stage 8 — Initial Bd summaries and pooled host-node overlay
+
+**Status:** Supporting/descriptive.
+
+```{r bd-stage-08-summaries}
+
+bd_clean <- bd %>%
+  transmute(
+    site_code = site,
+    year,
+    spp_code,
+    bd_positive = bd_infect,
+    bd_load = ave_ze_new
+  ) %>%
+  mutate(
+    
+    # convert to logical
+    bd_positive = case_when(
+      bd_positive %in% c("Y", "YES", "Positive", 1, TRUE) ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    
+    bd_load = as.numeric(bd_load)
+    
+  ) %>%
+  filter(
+    !is.na(site_code),
+    !is.na(year),
+    !is.na(spp_code)
+  )
+
+#host x site x year summaries
+bd_host_site_year <- bd_clean %>%
+  filter(
+    !is.na(spp_code),
+    !is.na(site_code),
+    !is.na(year)
+  ) %>%
+  group_by(spp_code, site_code, year) %>%
+  summarize(
+    # Only swabs with a recorded infection result enter prevalence
+    n_swabbed = sum(!is.na(bd_positive)),
+
+    n_positive = sum(
+      bd_positive == 1,
+      na.rm = TRUE
+    ),
+
+    prevalence = if_else(
+      n_swabbed > 0,
+      n_positive / n_swabbed,
+      NA_real_
+    ),
+
+    # Descriptive load summaries; intensity is modeled individually later
+    mean_load = if (
+      all(is.na(bd_load))
+    ) NA_real_ else mean(bd_load, na.rm = TRUE),
+
+    median_load = if (
+      all(is.na(bd_load))
+    ) NA_real_ else median(bd_load, na.rm = TRUE),
+
+    max_load = if (
+      all(is.na(bd_load))
+    ) NA_real_ else max(bd_load, na.rm = TRUE),
+
+    .groups = "drop"
+  )
+
+#aggregate to species level
+bd_host_summary <- bd_host_site_year %>%
+  group_by(spp_code) %>%
+  summarize(
+    total_swabbed = sum(n_swabbed),
+    prevalence = weighted.mean(prevalence, w = n_swabbed, na.rm = TRUE),
+    mean_load = weighted.mean(mean_load, w = n_swabbed, na.rm = TRUE),
+    median_load = median(median_load, na.rm = TRUE),
+    max_load = max(max_load, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#bd summaries only on pooled host nodes
+host_node_bd <- meta_node_summary %>%
+  filter(node_type == "Host") %>%
+  left_join(bd_host_summary, by = "spp_code")
+
+host_node_bd %>%
+  select(
+    label,
+    degree,
+    betweenness,
+    eigen,
+    total_swabbed,
+    prevalence,
+    mean_load,
+    median_load,
+    max_load
+  )
+
+
+#rank by centrality
+host_node_bd %>%
+  arrange(desc(degree))
+
+host_node_bd %>%
+  arrange(desc(eigen))
+
+host_node_bd %>%
+  arrange(desc(betweenness))
+
+#scatterplots 
+
+#deg vs prevalence
+p5 <- host_node_bd %>%
+  ggplot(
+    aes(
+      degree,
+      prevalence,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  labs(
+    x = "Host degree",
+    y = "Bd prevalence",
+    title = "Host centrality and Bd prevalence"
+  ) +
+  theme_minimal()
+
+#eig vs prevalence
+p6 <- host_node_bd %>%
+  ggplot(
+    aes(
+      eigen,
+      prevalence,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  labs(
+    x = "Eigenvector centrality",
+    y = "Bd prevalence",
+    title = "Eigenvector centrality and Bd prevalence"
+  ) +
+  theme_minimal()
+
+
+#deg vs mean load
+p7 <- host_node_bd %>%
+  ggplot(
+    aes(
+      degree,
+      mean_load,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  scale_y_continuous(trans = "log1p") +
+  labs(
+    x = "Host degree",
+    y = "Mean Bd load (log1p)",
+    title = "Host centrality and Bd intensity"
+  ) +
+  theme_minimal()
+
+
+#eig vs mean load
+p8 <- host_node_bd %>%
+  ggplot(
+    aes(
+      eigen,
+      mean_load,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  scale_y_continuous(trans = "log1p") +
+  labs(
+    x = "Eigenvector centrality",
+    y = "Mean Bd load (log1p)",
+    title = "Eigenvector centrality and Bd intensity"
+  ) +
+  theme_minimal()
+
+bd_overlay_grid <-
+  (p5 + p6) /
+  (p7 + p8)
+
+bd_overlay_grid
+```
+
+## 5.2 Stage 9.5 — Standardize unequal swab totals
+
+**Status:** Supporting sensitivity analysis. This is repeated subsampling/standardization rather than the primary inferential model.
+
+```{r bd-stage-095-standardization}
+# STAGE 9.5: Rarefaction of Bd data
+set.seed(6262026)
+
+# Number of swabs per species
+bd_clean %>%
+  count(spp_code)
+
+# Smallest sample size
+network_hosts <- c("BUBO", "PSRE", "RACA", "TAGR", "TATO")
+
+bd_network <- bd_clean %>%
+  filter(spp_code %in% network_hosts)
+
+bd_network %>%
+  count(spp_code)
+
+min_n <- bd_network %>%
+  count(spp_code) %>%
+  summarize(min_n = min(n)) %>%
+  pull()
+
+min_n
+
+rarefy_species <- function(df_species, sample_size){
+  
+  sampled <- df_species %>%
+    slice_sample(n = sample_size)
+  
+  tibble(
+    
+    prevalence =
+      mean(sampled$bd_positive),
+    
+    mean_load =
+      mean(sampled$bd_load, na.rm = TRUE),
+    
+    median_load =
+      median(sampled$bd_load, na.rm = TRUE),
+    
+    max_load =
+      max(sampled$bd_load, na.rm = TRUE)
+    
+  )
+}
+
+#repeat 1000
+n_iter <- 1000
+
+bd_rarefied <- map_dfr(
+  1:n_iter,
+  function(i){
+    bd_network %>%
+      group_by(spp_code) %>%
+      group_modify(~rarefy_species(.x, min_n)) %>%
+      ungroup() %>%
+      mutate(iteration = i)
+  }
+  
+)
+
+bd_rarefied_summary <- bd_rarefied %>%
+  
+  group_by(spp_code) %>%
+  
+  summarize(
+    
+    prevalence_mean =
+      mean(prevalence),
+    
+    prevalence_sd =
+      sd(prevalence),
+    
+    prevalence_lower =
+      quantile(prevalence, 0.025),
+    
+    prevalence_upper =
+      quantile(prevalence, 0.975),
+    
+    mean_load_mean =
+      mean(mean_load, na.rm = TRUE),
+    
+    mean_load_sd =
+      sd(mean_load, na.rm = TRUE),
+    
+    mean_load_lower =
+      quantile(mean_load, 0.025, na.rm = TRUE),
+    
+    mean_load_upper =
+      quantile(mean_load, 0.975, na.rm = TRUE),
+    
+    median_load_mean =
+      mean(median_load, na.rm = TRUE),
+    
+    max_load_mean =
+      mean(max_load, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+bd_rarefied_summary
+
+bd_comparison <- bd_host_summary %>%
+  
+  select(
+    spp_code,
+    total_swabbed,
+    prevalence,
+    mean_load
+  ) %>%
+  
+  left_join(
+    bd_rarefied_summary,
+    by = "spp_code"
+  )
+
+bd_comparison
+
+ggplot(
+  bd_rarefied_summary,
+  aes(
+    x = spp_code,
+    y = prevalence_mean
+  )
+) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(
+      ymin = prevalence_lower,
+      ymax = prevalence_upper
+    ),
+    
+    width = 0.15
+    
+  ) +
+  
+  labs(
+    x = "Host species",
+    y = "Rarefied Bd prevalence",
+    title = paste(
+      "Bd prevalence after rarefaction (n =",
+      min_n,
+      "swabs/species)"
+    )
+  ) +
+
+  theme_minimal()
+
+ggplot(
+  bd_rarefied_summary,
+  aes(
+    x = spp_code,
+    y = mean_load_mean
+  )
+) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(
+      ymin = mean_load_lower,
+      ymax = mean_load_upper
+    ),
+    width = 0.15
+  ) +
+  
+  labs(
+    x = "Host species",
+    y = "Rarefied mean Bd load",
+    title = paste(
+      "Bd load after rarefaction (n =",
+      min_n,
+      "swabs/species)"
+    )
+  ) +
+  theme_minimal()
+
+
+
+
+host_projection_bd <- host_projection_centrality %>%
+  left_join(
+    bd_rarefied_summary,
+    by = "spp_code"
+  )
+
+host_projection_bd
+
+host_projection_bd %>%
+  ggplot(
+    aes(
+      x = strength,
+      y = prevalence_mean,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = prevalence_lower,
+      ymax = prevalence_upper
+    ),
+    width = 0.03
+  ) +
+  labs(
+    x = "Projected host strength",
+    y = "Rarefied Bd prevalence",
+    title = "Parasite-sharing connectivity and standardized Bd prevalence"
+  ) +
+  theme_minimal()
+
+host_projection_bd %>%
+  ggplot(
+    aes(
+      x = strength,
+      y = mean_load_mean,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.02,
+    check_overlap = TRUE
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = mean_load_lower,
+      ymax = mean_load_upper
+    ),
+    width = 0.03
+  ) +
+  scale_y_continuous(trans = "log1p") +
+  labs(
+    x = "Projected host strength",
+    y = "Rarefied mean Bd load",
+    title = "Parasite-sharing connectivity and standardized Bd load"
+  ) +
+  theme_minimal()
+```
+
+### Retained interpretation
+
+- RACA had moderate parasite sharing but the highest raw/standardized prevalence.
+- TATO shared parasites broadly yet had the lowest prevalence.
+- TATO had an extreme Bd-load outlier that distorted arithmetic load summaries.
+- Projected hosts had similar strengths because the pooled projection was highly connected.
+
+## 5.3 Stage 9.6 — Log-scale Bd load sensitivity
+
+**Status:** Supporting sensitivity analysis.
+
+```{r bd-stage-096-log-load}
+# STAGE 9.6: Log-transform Bd load before rarefaction
+set.seed(6262026)
+
+# bd_load is right-skewed (see TATO outlier above) - log1p keeps zeros defined
+bd_network <- bd_network %>%
+  mutate(
+    log_bd_load = log1p(bd_load)
+  )
+
+rarefy_species_log <- function(df_species, sample_size){
+
+  sampled <- df_species %>%
+    slice_sample(n = sample_size)
+
+  tibble(
+    prevalence =
+      mean(sampled$bd_positive),
+
+    mean_log_load =
+      mean(sampled$log_bd_load, na.rm = TRUE),
+
+    median_log_load =
+      median(sampled$log_bd_load, na.rm = TRUE),
+
+    max_log_load =
+      max(sampled$log_bd_load, na.rm = TRUE)
+  )
+}
+
+bd_rarefied_log <- map_dfr(
+  1:n_iter,
+  function(i){
+    bd_network %>%
+      group_by(spp_code) %>%
+      group_modify(~rarefy_species_log(.x, min_n)) %>%
+      ungroup() %>%
+      mutate(iteration = i)
+  }
+)
+
+bd_rarefied_log_summary <- bd_rarefied_log %>%
+
+  group_by(spp_code) %>%
+
+  summarize(
+
+    prevalence_mean =
+      mean(prevalence),
+
+    prevalence_lower =
+      quantile(prevalence, 0.025),
+
+    prevalence_upper =
+      quantile(prevalence, 0.975),
+
+    mean_log_load_mean =
+      mean(mean_log_load, na.rm = TRUE),
+
+    mean_log_load_lower =
+      quantile(mean_log_load, 0.025, na.rm = TRUE),
+
+    mean_log_load_upper =
+      quantile(mean_log_load, 0.975, na.rm = TRUE),
+
+    median_log_load_mean =
+      mean(median_log_load, na.rm = TRUE),
+
+    max_log_load_mean =
+      mean(max_log_load, na.rm = TRUE),
+
+    .groups = "drop"
+  )
+
+bd_rarefied_log_summary
+
+# compare raw vs log-scale load estimates side by side
+bd_load_comparison <- bd_rarefied_summary %>%
+  select(spp_code, mean_load_mean, mean_load_lower, mean_load_upper) %>%
+  left_join(
+    bd_rarefied_log_summary %>%
+      select(spp_code, mean_log_load_mean, mean_log_load_lower, mean_log_load_upper),
+    by = "spp_code"
+  )
+
+bd_load_comparison
+
+ggplot(
+  bd_rarefied_log_summary,
+  aes(
+    x = spp_code,
+    y = mean_log_load_mean
+  )
+) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(
+      ymin = mean_log_load_lower,
+      ymax = mean_log_load_upper
+    ),
+    width = 0.15
+  ) +
+  labs(
+    x = "Host species",
+    y = "Rarefied mean log(Bd load + 1)",
+    title = paste(
+      "Log-transformed Bd load after rarefaction (n =",
+      min_n,
+      "swabs/species)"
+    )
+  ) +
+  theme_minimal()
+
+# does the outlier-driven TATO load story hold up on the log scale?
+host_projection_bd_log <- host_projection_centrality %>%
+  left_join(bd_rarefied_log_summary, by = "spp_code")
+
+host_projection_bd_log %>%
+  ggplot(
+    aes(
+      x = strength,
+      y = mean_log_load_mean,
+      label = spp_code
+    )
+  ) +
+  geom_point(size = 3) +
+  geom_text(
+    nudge_y = 0.05,
+    check_overlap = TRUE
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = mean_log_load_lower,
+      ymax = mean_log_load_upper
+    ),
+    width = 0.03
+  ) +
+  labs(
+    x = "Projected host strength",
+    y = "Rarefied mean log(Bd load + 1)",
+    title = "Parasite-sharing connectivity and log-scale Bd load"
+  ) +
+  theme_minimal()
+```
+
+## 5.4 Stage 18 — Two-part Bd model
+
+**Status:** Supporting/deprioritized. This is the cleanest Bd model currently available: infection occurrence is separated from intensity conditional on infection.
+
+```{r bd-stage-18-two-part}
+# STAGE 18: Model Bd using numerator/denominator directly, and split
+# infection probability from infection intensity, rather than modeling
+# an arithmetic site-year mean load (Stage 9.5/9.6's rarefaction stays
+# useful as a sensitivity check, but isn't the primary inferential model)
+
+bd_model_df <- bd_env_df %>%
+  mutate(
+    n_negative = n_swabbed - n_positive,
+    site_year = interaction(site_code, year, drop = TRUE)
+  ) %>%
+  left_join(bullfrog_survey_status, by = c("site_code", "year")) %>%
+  filter(!is.na(bullfrog_detected))
+
+# site-year prevalence - weights precision by n_swabbed properly, unlike
+# treating every site-year's rarefied prevalence as equally informative
+m_bd_prevalence_additive <- glmmTMB(
+  cbind(n_positive, n_negative) ~
+    bullfrog_detected +
+    longevity +
+    scale(log1p(pond_area_m)) +
+    scale(max_depth_m) +
+    ever_dry +
+    spp_code +
+    scale(year) +
+    (1 | site_code) +
+    (1 | site_year),
+  family = betabinomial,
+  data = bd_model_df
+)
+
+summary(m_bd_prevalence_additive)
+
+# individual-level two-part model: does infection occur, and if so, how
+# intense (replaces treating raw/log mean load as the only load metric)
+bd_occurrence_focal <- bd_clean %>%
+  filter(
+    spp_code %in% c("BUBO", "PSRE", "RACA", "TAGR", "TATO"),
+    !is.na(bd_positive)
+  ) %>%
+  mutate(
+    spp_code = relevel(factor(spp_code), ref = "BUBO")
+  )
+
+m_bd_occurrence <- glmmTMB(
+  bd_positive ~
+    spp_code +
+    scale(year) +
+    (1 | site_code),
+  family = binomial,
+  data = bd_occurrence_focal
+)
+
+summary(m_bd_occurrence)
+
+m_bd_intensity <- glmmTMB(
+  bd_load ~
+    spp_code +
+    scale(year) +
+    (1 | site_code),
+  family = lognormal(),
+  data = bd_clean %>%
+    filter(bd_positive == 1, bd_load > 0)
+)
+
+summary(m_bd_intensity)
+```
+
+### Current interpretation
+
+- Bd differed strongly among host species, but there was little evidence for broad temporal or pond-level effects.
+- Relative to BUBO, PSRE, TAGR, and TATO had significantly lower individual infection probabilities in the focal-host model; RACA did not differ clearly.
+- TAGR and TATO showed lower conditional intensity in the fitted output, although the original note highlighted TATO most strongly.
+- Environmental factors and year generally did not predict Bd prevalence, occurrence, or intensity.
+
+
+## 5.5 H4 Prediction
+
+```{r}
+# H4: does macroparasite-network position correspond to Bd infection risk?
+# tested against BOTH Bd metrics, since "position corresponds to risk"
+# shouldn't depend on which Bd outcome happens to get used
+
+local_projection_centrality <- hp_edges %>%
+  group_by(site_code, year) %>%
+  group_modify(function(df, keys) {
+    if (n_distinct(df$spp_code) < 3) return(tibble())
+    projection <- build_host_jaccard_projection(df)
+    g <- projection$graph
+    tibble(
+      spp_code = igraph::V(g)$name,
+      local_strength = igraph::strength(g, weights = igraph::E(g)$jaccard),
+      local_parasite_richness = igraph::V(g)$parasite_richness
+    )
+  }) %>%
+  ungroup()
+
+# parasites per individual - macroparasite burden proxy, parallel to bd_load
+parasites_per_indiv <- hp_edges %>%
+  group_by(site_code, year, spp_code) %>%
+  summarize(
+    total_parasites = sum(total_parasites, na.rm = TRUE),
+    n_hosts_examined = max(n_hosts_examined, na.rm = TRUE),
+    parasites_per_host = total_parasites / n_hosts_examined,
+    .groups = "drop"
+  )
+
+bd_local_network <- bd_host_site_year %>%
+  left_join(local_projection_centrality, by = c("site_code", "year", "spp_code")) %>%
+  left_join(parasites_per_indiv, by = c("site_code", "year", "spp_code")) %>%
+  filter(!is.na(local_strength))
+
+# model 1: Bd prevalence as the outcome (weights by n_swabbed properly)
+m_bd_prevalence_local <- glmmTMB(
+  cbind(n_positive, n_swabbed - n_positive) ~
+    scale(local_strength) +
+    scale(local_parasite_richness) +
+    spp_code +
+    scale(year) +
+    (1 | site_code),
+  family = betabinomial,
+  data = bd_local_network
+)
+
+summary(m_bd_prevalence_local)
+
+# model 2: Bd load as the outcome - continuous, conditional on a positive mean
+m_bd_load_local <- glmmTMB(
+  mean_load ~
+    scale(local_strength) +
+    scale(local_parasite_richness) +
+    spp_code +
+    scale(year) +
+    (1 | site_code),
+  family = lognormal(),
+  data = bd_local_network %>% filter(mean_load > 0)
+)
+
+summary(m_bd_load_local)
+
+# the detailed comparison: does centrality's association with Bd flip sign
+# or significance depending on which Bd metric is used?
+tibble(
+  outcome = c("prevalence", "load"),
+  local_strength_estimate = c(
+    fixef(m_bd_prevalence_local)$cond[["scale(local_strength)"]],
+    fixef(m_bd_load_local)$cond[["scale(local_strength)"]]
+  )
+)
+```
+
+- RACA as the std of comparison
+
+
+
+
+
+### Decision for the network paper
+
+Retain at most one final local site-year network-position test. If local macroparasite position does not predict Bd, report that negative boundary result briefly and close this branch rather than expanding additional Bd models.
+
+
+
+
+
+# 6. Deprioritized or superseded analyses
+
+These blocks are retained so that exploratory work and written interpretations are not lost, but they are excluded from the active workflow. They are set to `eval=FALSE`.
+
+## 6.1 Stage 6 — Bullfrog status inferred from `hp_edges`
+
+**Status:** Superseded by independent survey-based `bullfrog_detected`. Absence from parasite records cannot establish biological absence.
+
+```{r archive-stage-06-bullfrog, eval=FALSE}
+#stage 6: bullfrog presence - absence
+
+bullfrog <- "RACA"
+bullfrog_site_years <- hp_edges %>%
+  distinct(site_code, year, spp_code) %>%
+  group_by(site_code, year) %>%
+  summarize(
+    bullfrog_present = any(spp_code == bullfrog),
+    .groups = "drop"
+  )
+
+bullfrog_site_years %>%
+  count(bullfrog_present)
+
+#adding bullfrog presence status to all edges 
+hp_edges_bf <- hp_edges %>%
+  left_join(
+    bullfrog_site_years,
+    by = c("site_code", "year")
+  ) %>%
+  mutate(
+    bullfrog_present = replace_na(bullfrog_present, FALSE),
+    bullfrog_status = if_else(
+      bullfrog_present,
+      "Bullfrog present",
+      "Bullfrog absent"
+    )
+  )
+
+hp_edges_bf %>%
+  count(bullfrog_status)
+
+#building present/absent networks 
+bf_present_net <- build_subset_network(
+  data = hp_edges_bf %>% filter(bullfrog_present),
+  subset_type = "bullfrog_status",
+  subset_value = "present"
+)
+
+bf_absent_net <- build_subset_network(
+  data = hp_edges_bf %>% filter(!bullfrog_present),
+  subset_type = "bullfrog_status",
+  subset_value = "absent"
+)
+
+
+#network level comparison
+bullfrog_network_summary <- bind_rows(
+  summarize_hp_graph(
+    g = bf_present_net$graph,
+    subset_type = "bullfrog_status",
+    subset_value = "present"
+  ),
+  summarize_hp_graph(
+    g = bf_absent_net$graph,
+    subset_type = "bullfrog_status",
+    subset_value = "absent"
+  )
+)
+
+bullfrog_network_summary
+
+#node level comparison 
+
+bullfrog_node_summary <- bind_rows(
+  summarize_hp_nodes(
+    g = bf_present_net$graph,
+    subset_type = "bullfrog_status",
+    subset_value = "present"
+  ),
+  summarize_hp_nodes(
+    g = bf_absent_net$graph,
+    subset_type = "bullfrog_status",
+    subset_value = "absent"
+  )
+)
+
+bullfrog_node_summary
+
+#host centrality by bullfrog status
+bullfrog_node_summary %>%
+  filter(node_type == "Host") %>%
+  select(subset_value, label, degree, betweenness, eigen) %>%
+  arrange(subset_value, desc(degree))
+
+#parasite comparison 
+bullfrog_node_summary %>%
+  filter(node_type == "Parasite") %>%
+  select(subset_value, label, degree, betweenness, eigen) %>%
+  arrange(subset_value, desc(degree))
+
+#bullfrog network comparison (plot)
+bullfrog_network_summary %>%
+  pivot_longer(
+    cols = c(n_hosts, n_parasites, n_edges, connectance, modularity),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = subset_value, y = value)) +
+  geom_col() +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(
+    x = "Bullfrog status",
+    y = NULL,
+    title = "Host-parasite network structure by bullfrog status"
+  ) +
+  theme_minimal()
+
+#parasite degree by bullfrog status
+bullfrog_node_summary %>%
+  filter(node_type == "Parasite") %>%
+  ggplot(aes(x = reorder(label, degree), y = degree)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ subset_value) +
+  labs(
+    x = "Parasite taxon",
+    y = "Degree",
+    title = "Parasite host breadth by bullfrog status"
+  ) +
+  theme_minimal()
+```
+
+## 6.2 Stage 9 — Ordinary linear models
+
+**Status:** Superseded by mixed models with response-appropriate families, sampling-effort adjustment, and diagnostics.
+
+```{r archive-stage-09-lm, eval=FALSE}
+#stage 9: stat time 
+
+#building summaries + checking n
+site_year_network_summary <- hp_edges_bf %>%
+  group_by(site_code, year) %>%
+  group_split() %>%
+  map_dfr(function(df_sy) {
+    
+    site_i <- unique(df_sy$site_code)
+    year_i <- unique(df_sy$year)
+    longevity_i <- unique(df_sy$longevity)
+    bullfrog_i <- unique(df_sy$bullfrog_present)
+    
+    g_sy <- build_hp_graph(df_sy)
+    
+    summarize_hp_graph(
+      g = g_sy,
+      subset_type = "site_year",
+      subset_value = paste(site_i, year_i, sep = "_")
+    ) %>%
+      mutate(
+        site_code = site_i,
+        year = year_i,
+        longevity = longevity_i[1],
+        bullfrog_present = bullfrog_i[1]
+      )
+  }) %>%
+  relocate(site_code, year, longevity, bullfrog_present)
+
+site_year_network_summary
+
+
+site_year_network_summary %>%
+  summarize(
+    n_site_years = n(),
+    n_sites = n_distinct(site_code),
+    min_year = min(year),
+    max_year = max(year)
+  )
+
+site_year_network_summary %>%
+  count(bullfrog_present)
+
+site_year_network_summary %>%
+  count(longevity)
+
+#lm
+
+lm_connectance <- lm(
+  connectance ~ bullfrog_present + longevity + year,
+  data = site_year_network_summary
+)
+
+summary(lm_connectance)
+
+lm_modularity <- lm(
+  modularity ~ bullfrog_present + longevity + year,
+  data = site_year_network_summary
+)
+
+summary(lm_modularity)
+
+lm_parasites <- lm(
+  n_parasites ~ bullfrog_present + longevity + year,
+  data = site_year_network_summary
+)
+
+summary(lm_parasites)
+
+
+site_year_network_summary %>%
+  ggplot(aes(x = bullfrog_present, y = connectance)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1, alpha = 0.6) +
+  labs(
+    x = "Bullfrog present",
+    y = "Connectance",
+    title = "Site-year network connectance by bullfrog presence"
+  ) +
+  theme_minimal()
+
+site_year_network_summary %>%
+  ggplot(aes(x = longevity, y = n_parasites)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1, alpha = 0.6) +
+  labs(
+    x = "Pond longevity",
+    y = "Parasite richness",
+    title = "Parasite richness by pond longevity"
+  ) +
+  theme_minimal()
+
+#Bullfrogs are associated with more parasite taxa, lower connectance, higher modularity
+
+#stage 10
+```
+
+## 6.3 Stage 16 — First GLMM pass
+
+**Status:** Superseded by Stages 23–24. The richness dataset was conditioned on `n_parasites >= 3`, and the interaction should not be used without adequate bullfrog-by-longevity support.
+
+```{r archive-stage-16-first-glmm, eval=FALSE}
+# STAGE 16: Replace ordinary lm (Stage 9) with GLMMs that account for
+# repeated measurement within site and use response-appropriate
+
+network_df_model <- network_df %>%
+  filter(!network_too_small)
+
+# parasite richness - overdispersed count, site random effect, effort as
+# a covariate (NOT an offset - richness doesn't scale proportionally with n)
+m_richness <- glmmTMB(
+  n_parasites ~
+    bullfrog_present * longevity +
+    scale(year) +
+    scale(log1p(total_dissected)) +
+    (1 | site_code),
+  family = poisson,
+  data = network_df_model
+)
+
+summary(m_richness)
+
+# connectance - realized links out of possible links, beta-binomial to
+# absorb overdispersion a plain binomial can't
+network_df_model <- network_df_model %>%
+  mutate(
+    possible_links = n_hosts * n_parasites,
+    missing_links = possible_links - n_edges
+  )
+
+m_connectance <- glmmTMB(
+  cbind(n_edges, missing_links) ~
+    bullfrog_present * longevity +
+    scale(year) +
+    scale(log1p(total_dissected)) +
+    (1 | site_code),
+  family = betabinomial,
+  data = network_df_model
+)
+
+summary(m_connectance)
+
+network_df_model %>%
+  ggplot(aes(x = bullfrog_present, y = connectance)) +
+  geom_boxplot() +
+  geom_jitter(aes(color = longevity), width = 0.1, alpha = 0.6) +
+  labs(
+    x = "Bullfrog present (survey-based)",
+    y = "Connectance",
+    color = "Longevity",
+    title = "Site-year connectance by bullfrog presence and longevity"
+  ) +
+  theme_minimal()
+```
+
+## 6.4 Stage 11 — Bd prevalence predicting macroparasite outcomes
+
+**Status:** Deprioritized. The host-level analysis had only five observations, and the site-year analysis did not establish a compelling network mechanism.
+
+```{r archive-stage-11-bd-to-parasites, eval=FALSE}
+# STAGE 11: Bd prevalence as a predictor of parasite outcomes
+# n = 5 host species at the species level, so treat these as exploratory/
+# descriptive rather than confirmatory - the site x year model below has
+# more data points and lets spp_code absorb host-level baseline differences
+
+# host-level parasite outcomes (richness + burden), from the raw interaction table
+host_parasite_outcomes <- hp_edges %>%
+  group_by(spp_code) %>%
+  summarize(
+    parasite_richness = n_distinct(parasite_name),
+    total_parasite_count = sum(total_parasites, na.rm = TRUE),
+    n_host_records = sum(n_hosts_examined),
+    .groups = "drop"
+  )
+
+bd_parasite_model_df <- bd_host_summary %>%
+  select(spp_code, total_swabbed, prevalence, mean_load) %>%
+  inner_join(host_parasite_outcomes, by = "spp_code")
+
+bd_parasite_model_df
+
+# species-level: prevalence -> parasite richness
+m_richness <- lm(parasite_richness ~ prevalence, data = bd_parasite_model_df)
+summary(m_richness)
+
+# species-level: prevalence -> total parasite burden
+m_burden <- lm(total_parasite_count ~ prevalence, data = bd_parasite_model_df)
+summary(m_burden)
+
+ggplot(
+  bd_parasite_model_df,
+  aes(x = prevalence, y = parasite_richness, label = spp_code)
+) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_text(nudge_y = 0.15, check_overlap = TRUE) +
+  labs(
+    x = "Bd prevalence",
+    y = "Parasite richness",
+    title = "Bd prevalence as a predictor of parasite richness"
+  ) +
+  theme_minimal()
+
+ggplot(
+  bd_parasite_model_df,
+  aes(x = prevalence, y = total_parasite_count, label = spp_code)
+) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_text(nudge_y = 0.15, check_overlap = TRUE) +
+  labs(
+    x = "Bd prevalence",
+    y = "Total parasite count",
+    title = "Bd prevalence as a predictor of total parasite burden"
+  ) +
+  theme_minimal()
+
+# site x year level model - more observations, host species as a covariate
+site_year_parasite_outcomes <- hp_edges %>%
+  group_by(site_code, year, spp_code) %>%
+  summarize(
+    parasite_richness = n_distinct(parasite_name),
+    total_parasite_count = sum(total_parasites, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+bd_parasite_siteyear_df <- bd_host_site_year %>%
+  select(spp_code, site_code, year, n_swabbed, prevalence, mean_load) %>%
+  inner_join(
+    site_year_parasite_outcomes,
+    by = c("spp_code", "site_code", "year")
+  )
+
+bd_parasite_siteyear_df
+
+m_richness_siteyear <- lm(
+  parasite_richness ~ prevalence + spp_code,
+  data = bd_parasite_siteyear_df
+)
+summary(m_richness_siteyear)
+
+m_burden_siteyear <- lm(
+  total_parasite_count ~ prevalence + spp_code,
+  data = bd_parasite_siteyear_df
+)
+summary(m_burden_siteyear)
+
+ggplot(
+  bd_parasite_siteyear_df,
+  aes(x = prevalence, y = parasite_richness, color = spp_code)
+) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Bd prevalence (site x year)",
+    y = "Parasite richness (site x year)",
+    color = "Host species",
+    title = "Bd prevalence and parasite richness, by host species"
+  ) +
+  theme_minimal()
+```
+
+### Retained interpretation
+
+- Significant host-specific differences appeared for some Bd/parasite outcomes, but no consistent association connected Bd prevalence to macroparasite richness or burden.
+
+## 6.5 Stage 12 — Early environmental Bd models
+
+**Status:** Superseded/deprioritized. Arithmetic mean load, unweighted prevalence proportions, and arbitrary site-year environmental summaries were replaced by the cleaner covariate preparation and two-part models.
+
+```{r archive-stage-12-environment-bd, eval=FALSE}
+# STAGE 12: Env/pond properties as predictors of disease dynamics
+
+# --- site-level static properties (site_info) ---
+env_site <- site_info %>%
+  select(
+    site_code,
+    longevity,
+    class,
+    origin,
+    elevation_m,
+    property_area_m2,
+    meta_comm_area_m2,
+    latitude,
+    longitude
+  )
+
+# --- site x year pond properties (wetland_info) ---
+# wetland_info has multiple assessments per site-year (assmt_code/date vary),
+# so collapse to one row per site x year before joining
+env_site_year <- wetland_info %>%
+  rename(site_code = site) %>%
+  mutate(
+    # standardize "dry" to logical regardless of how it's coded (Y/N, 0/1, TRUE/FALSE)
+    dry_logical = dry %in% c("Y", "YES", "Yes", "TRUE", TRUE, 1)
+  ) %>%
+  group_by(site_code, year) %>%
+  summarize(
+    pond_area_m   = mean(pond_area_m, na.rm = TRUE),
+    perimeter_m   = mean(perimeter_m, na.rm = TRUE),
+    max_depth_m   = mean(max_depth_m, na.rm = TRUE),
+    trophic_state = first(na.omit(trophic_state)),
+    ever_dry      = any(dry_logical, na.rm = TRUE),
+    n_assessments = n(),
+    .groups = "drop"
+  )
+
+# --- Bd + env data at the site x year x host level ---
+bd_env_df <- bd_host_site_year %>%
+  left_join(
+    env_site,
+    by = "site_code"
+  ) %>%
+  left_join(
+    env_site_year,
+    by = c("site_code", "year")
+  ) %>%
+  mutate(
+    longevity = factor(longevity),
+    trophic_state = factor(trophic_state),
+    class = factor(class),
+    spp_code = factor(spp_code)
+  )
+
+bd_env_df
+
+# --- static site properties: pond permanence / class ---
+m_env_prevalence_static <- lm(
+  prevalence ~ longevity + spp_code,
+  data = bd_env_df
+)
+summary(m_env_prevalence_static)
+
+m_env_load_static <- lm(
+  mean_load ~ longevity + spp_code,
+  data = bd_env_df
+)
+summary(m_env_load_static)
+
+# --- dynamic pond properties: size, depth, trophic state, dry-down ---
+m_env_prevalence_dynamic <- lm(
+  prevalence ~ scale(pond_area_m) + scale(max_depth_m) + trophic_state + ever_dry + spp_code,
+  data = bd_env_df
+)
+summary(m_env_prevalence_dynamic)
+
+m_env_load_dynamic <- lm(
+  mean_load ~ scale(pond_area_m) + scale(max_depth_m) + trophic_state + ever_dry + spp_code,
+  data = bd_env_df
+)
+summary(m_env_load_dynamic)
+
+# --- visualizations ---
+ggplot(bd_env_df, aes(x = longevity, y = prevalence)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = spp_code), width = 0.15, alpha = 0.6) +
+  labs(
+    x = "Pond longevity class",
+    y = "Bd prevalence",
+    color = "Host species",
+    title = "Pond permanence and Bd prevalence"
+  ) +
+  theme_minimal()
+
+ggplot(bd_env_df, aes(x = trophic_state, y = prevalence)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = spp_code), width = 0.15, alpha = 0.6) +
+  labs(
+    x = "Trophic state",
+    y = "Bd prevalence",
+    color = "Host species",
+    title = "Pond trophic state and Bd prevalence"
+  ) +
+  theme_minimal()
+
+ggplot(bd_env_df, aes(x = max_depth_m, y = prevalence, color = spp_code)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Max pond depth (m)",
+    y = "Bd prevalence",
+    color = "Host species",
+    title = "Pond depth and Bd prevalence, by host species"
+  ) +
+  theme_minimal()
+
+ggplot(bd_env_df, aes(x = ever_dry, y = prevalence)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = spp_code), width = 0.15, alpha = 0.6) +
+  labs(
+    x = "Pond dried down that year",
+    y = "Bd prevalence",
+    color = "Host species",
+    title = "Dry-down events and Bd prevalence"
+  ) +
+  theme_minimal()
+
+# does pond permanence/trophic state also relate to realized parasite richness at a site?
+site_env_richness <- hp_edges %>%
+  distinct(site_code, parasite_name, longevity) %>%
+  count(site_code, longevity, name = "parasite_richness") %>%
+  left_join(
+    env_site %>% select(site_code, class),
+    by = "site_code"
+  )
+
+ggplot(site_env_richness, aes(x = longevity, y = parasite_richness)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.6) +
+  labs(
+    x = "Pond longevity class",
+    y = "Parasite richness at site",
+    title = "Pond permanence and parasite richness"
+  ) +
+  theme_minimal()
+```
+
+### Retained visual interpretations
+
+- Semi-permanent ponds appeared to have the highest median Bd prevalence, permanent ponds were more bimodal, and temporary ponds were closer to zero prevalence.
+- No clear difference appeared among trophic-state categories.
+- Pond depth and prevalence appeared correlated in some species-specific plots, especially RACA, but this was not supported by the stronger models.
+- No obvious reduction in Bd prevalence was associated with drying events.
+- Permanent sites appeared to have higher pooled parasite richness.
+
+These are exploratory visual patterns and should not be promoted over the later model results.
+
+# 7. Backlog and next analyses
+
+## 7.1 Highest-priority unresolved tasks
+
+1. **Complete Stage 23:** verify the zero-richness assumption, compare Poisson and COM-Poisson, and keep the richness result only if diagnostics are acceptable.
+2. **Complete Stage 24:** validate connectance, inspect overlap in the exact complete-case data, and summarize threshold sensitivity.
+3. **Build a replicated modularity response:** calculate bipartite/null-standardized modularity for eligible site-years and model it with the same H1/H2 predictors.
+4. **Finalize H3 uncertainty:** report the number of sites in each transition and repeat `beta_os` versus `beta_st` under effort thresholds.
+5. **Improve paper figures:** replace generic table dumps and default plots with a small set of publication-oriented visuals tied directly to H1–H3.
+
+## 7.2 Planned but lower-priority directions
+
+- Parasite dynamics during drought years.
+- Seasonal changes in dominant hosts and parasites.
+- Life stage as a predictor or H3 partition, after evaluating stage-specific sampling.
+- Alternative grouping if longevity classes leave sparse site-year cells.
+- Parasites per individual and site-year prevalence summaries.
+- Bd edges weighted by prevalence or load, only as a clearly labeled exploratory comparison.
+
+## 7.3 Analyses not to expand without a new mechanistic reason
+
+- Additional broad environmental predictors of Bd.
+- Repeated transformations or subsets designed mainly to obtain significance.
+- Additional pooled centrality metrics when the host projection is nearly complete.
+- Causal “invasion effects” based only on first detection.
+
+# 8. Working results summary
+
+## H1 — Bullfrog detection
+
+**Current answer:** Preliminary associations suggest that bullfrog-detected site-years may differ in network structure, particularly connectance and modularity, but no final H1 claim should be made until the corrected richness model, validated connectance model, and replicated modularity analysis are complete.
+
+## H2 — Pond permanence
+
+**Current answer:** Pooled descriptive networks differ by permanence, but inferential evidence remains provisional. Permanence should be treated as hydroperiod/habitat structure and modeled jointly with bullfrog detection, year, and sampling effort.
+
+## H3 — Temporal dynamics
+
+**Current answer:** Temporal composition is dynamic. The primary within-site analysis suggests that turnover of observed taxa contributes more than rewiring among shared taxa, whereas pooled analyses made rewiring appear more prominent.
+
+## Exploratory Bd question
+
+**Current answer:** Bd is primarily host-specific in the current models and has little demonstrated relationship to broad pond conditions or pooled macroparasite network position. It should remain a contained exploratory branch.
