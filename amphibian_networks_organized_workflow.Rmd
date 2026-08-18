@@ -72,7 +72,7 @@ library(knitr)
 library(patchwork)
 library(glmmTMB)
 library(DHARMa)
-library(bipartite)
+#library(bipartite)
 
 # Optional audit of available files / column names
 files <- list.files("Desktop/briggs/networks/kacie_csvs", pattern = "\\.csv$", full.names = TRUE)
@@ -2462,12 +2462,18 @@ network_beta <- function(edges_a, edges_b) {
 
   # Use the same matrix dimensions for both networks
   all_hosts <- sort(
-    union(unique(edges_a$host), unique(edges_b$host))
+  base::union(
+    unique(edges_a$host),
+    unique(edges_b$host)
   )
+)
 
-  all_parasites <- sort(
-    union(unique(edges_a$parasite), unique(edges_b$parasite))
+all_parasites <- sort(
+  base::union(
+    unique(edges_a$parasite),
+    unique(edges_b$parasite)
   )
+)
 
   web_a <- edges_to_matrix(
     edges = edges_a,
@@ -3007,15 +3013,15 @@ within_site_rewiring <- hp_edges %>%
           filter(year == yr2) %>%
           select(host, parasite)
 
-        shared_hosts <- intersect(
-          unique(e1$host),
-          unique(e2$host)
-        )
+        shared_hosts <- base::intersect(
+  unique(e1$host),
+  unique(e2$host)
+)
 
-        shared_parasites <- intersect(
-          unique(e1$parasite),
-          unique(e2$parasite)
-        )
+shared_parasites <- base::intersect(
+  unique(e1$parasite),
+  unique(e2$parasite)
+)
 
         # Minimum requirements for estimating rewiring
         if (
@@ -3616,6 +3622,702 @@ p_stage_overall <- ggplot2::ggplot(
     legend.position = "bottom"
   )
 
+```
+
+##4.6 zeroing in on H3
+
+### 1–2. Sampling frame + restricted, threshold-tested transitions
+
+```{r h3-paper-00-settings}
+# same construction as Stage 15 (section 3.4) - restated here so section 4
+# doesn't depend on section 3 having been run first
+network_effort <- amphib_dissect %>%
+  filter(dissected %in% TRUE) %>%
+  group_by(site_code, year) %>%
+  summarize(
+    total_dissected = n_distinct(dissect_code),
+    host_species_dissected = n_distinct(spp_code),
+    .groups = "drop"
+  )
+
+theme_pub <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey90"),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+      plot.title = element_text(size = base_size, face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+col_os <- "#0072B2"  # rewiring
+col_st <- "#D55E00"  # turnover
+col_gold <- "#E69F00"
+
+# build_within_site_transitions: eligible -> five separate diagnostic flags
+build_within_site_transitions <- function(
+    edge_data, effort_data,
+    min_links = 3, min_hosts_dissected = 0,
+    min_shared_hosts = 2, min_shared_parasites = 2
+) {
+
+  effort_lookup <- effort_data %>% select(site_code, year, total_dissected)
+
+  edge_data %>%
+    distinct(site_code, year, host, parasite) %>%
+    group_by(site_code) %>%
+    group_modify(function(df_site, keys) {
+
+      yrs <- sort(unique(df_site$year))
+      if (length(yrs) < 2) return(tibble())
+
+      site_effort <- effort_lookup %>% filter(site_code == keys$site_code)
+
+      map_dfr(seq_len(length(yrs) - 1), function(i) {
+
+        yr1 <- yrs[i]; yr2 <- yrs[i + 1]
+
+        e1 <- df_site %>% filter(year == yr1) %>% select(host, parasite)
+        e2 <- df_site %>% filter(year == yr2) %>% select(host, parasite)
+
+        effort_1 <- site_effort %>% filter(year == yr1) %>% pull(total_dissected)
+        effort_2 <- site_effort %>% filter(year == yr2) %>% pull(total_dissected)
+        effort_1 <- if (length(effort_1) == 0) NA_real_ else effort_1
+        effort_2 <- if (length(effort_2) == 0) NA_real_ else effort_2
+
+        shared_hosts <- intersect(unique(e1$host), unique(e2$host))
+        shared_parasites <- intersect(unique(e1$parasite), unique(e2$parasite))
+
+        links_ok <- nrow(e1) >= min_links && nrow(e2) >= min_links
+        shared_hosts_ok <- length(shared_hosts) >= min_shared_hosts
+        shared_parasites_ok <- length(shared_parasites) >= min_shared_parasites
+        effort_ok <- !is.na(effort_1) && !is.na(effort_2) &&
+          effort_1 >= min_hosts_dissected && effort_2 >= min_hosts_dissected
+
+        network_beta(e1, e2) %>%
+          mutate(
+            year_from = yr1, year_to = yr2, year_gap = yr2 - yr1,
+            is_adjacent_year = year_gap == 1,
+            effort_from = effort_1, effort_to = effort_2,
+            links_ok = links_ok,
+            shared_hosts_ok = shared_hosts_ok,
+            shared_parasites_ok = shared_parasites_ok,
+            effort_ok = effort_ok,
+            eligible = links_ok & shared_hosts_ok & shared_parasites_ok & effort_ok,
+            .before = 1
+          )
+      })
+    }) %>%
+    ungroup()
+}
+
+baseline_transitions <- build_within_site_transitions(
+  hp_edges_beta, network_effort, min_links = 3, min_hosts_dissected = 0
+)
+
+# eligibility labels built ONLY from adjacent transitions - a pond-year
+# touching only a multiyear gap should never read as "eligible"
+adjacent_baseline_transitions <- baseline_transitions %>% filter(is_adjacent_year)
+
+pond_year_frame <- network_effort %>%
+  left_join(
+    hp_edges_beta %>%
+      group_by(site_code, year) %>%
+      summarize(n_host_taxa = n_distinct(host), n_parasite_taxa = n_distinct(parasite), n_links = n(), .groups = "drop"),
+    by = c("site_code", "year")
+  ) %>%
+  mutate(across(c(n_host_taxa, n_parasite_taxa, n_links), ~replace_na(.x, 0L))) %>%
+  left_join(
+    adjacent_baseline_transitions %>% select(site_code, year_to, eligible_incoming = eligible),
+    by = c("site_code", "year" = "year_to")
+  ) %>%
+  left_join(
+    adjacent_baseline_transitions %>% select(site_code, year_from, eligible_outgoing = eligible),
+    by = c("site_code", "year" = "year_from")
+  ) %>%
+  mutate(
+    coverage_status = case_when(
+      n_links == 0 ~ "No interactions recorded",
+      eligible_incoming %in% TRUE | eligible_outgoing %in% TRUE ~ "Included in eligible adjacent transition",
+      TRUE ~ "Sampled, not eligible"
+    )
+  )
+
+# pond-years with n_links == 0 are kept here for transparency, but the beta-diversity partition (Poisot et al. 2012)
+# cannot be computed from an empty network. The temporal-network analysis
+# is conditional on both years of a transition having an estimable network
+# - this is a scope statement, not a missing-data problem to fix.
+
+primary_transitions <- baseline_transitions %>% filter(is_adjacent_year, eligible)
+gap_transitions <- baseline_transitions %>% filter(!is_adjacent_year)
+
+primary_transitions
+gap_transitions
+
+
+# complete sampling flow / consort-style funnel
+sampling_flow <- tibble(
+  step = c(
+    "Total pond-years sampled",
+    "Pond-years with \u22651 interaction",
+    "Total consecutive observed comparisons",
+    "Adjacent-year comparisons",
+    "...meeting link criteria",
+    "...meeting shared-taxa criteria",
+    "Final primary transitions",
+    "Final ponds represented"
+  ),
+  n = c(
+    nrow(pond_year_frame),
+    sum(pond_year_frame$n_links > 0),
+    nrow(baseline_transitions),
+    sum(baseline_transitions$is_adjacent_year),
+    sum(baseline_transitions$is_adjacent_year & baseline_transitions$links_ok),
+    sum(baseline_transitions$is_adjacent_year & baseline_transitions$links_ok &
+          baseline_transitions$shared_hosts_ok & baseline_transitions$shared_parasites_ok),
+    nrow(primary_transitions),
+    n_distinct(primary_transitions$site_code)
+  )
+)
+
+sampling_flow
+
+# why are adjacent transitions excluded? (diagnostic breakdown, not just a count)
+baseline_transitions %>%
+  filter(is_adjacent_year, !eligible) %>%
+  summarize(
+    n_excluded = n(),
+    failed_links = sum(!links_ok),
+    failed_shared_hosts = sum(!shared_hosts_ok),
+    failed_shared_parasites = sum(!shared_parasites_ok),
+    failed_effort = sum(!effort_ok)
+  )
+
+
+fig_sampling_frame <- pond_year_frame %>%
+  mutate(
+    coverage_status = case_when(
+      n_links == 0 ~ "No interactions recorded",
+      eligible_incoming %in% TRUE | eligible_outgoing %in% TRUE ~ "Eligible transition",
+      TRUE ~ "Sampled, not eligible"
+    )
+  ) %>%
+  ggplot(aes(x = year, y = fct_rev(factor(site_code)), fill = coverage_status)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_manual(
+    values = c(
+      "No interactions recorded" = "grey85",
+      "Sampled, not eligible" = col_gold,
+      "Eligible transition" = col_os
+    ),
+    name = NULL
+  ) +
+  labs(x = "Year", y = "Pond", title = "Sampling frame: coverage and transition eligibility") +
+  theme_pub()
+
+fig_sampling_frame
+
+fig_links_per_pond_year <- pond_year_frame %>%
+  ggplot(aes(x = year, y = n_links, group = site_code)) +
+  geom_line(alpha = 0.4, color = "grey50") +
+  geom_point(aes(color = n_links >= 3), size = 1.8) +
+  scale_color_manual(
+    values = c("TRUE" = col_os, "FALSE" = "grey70"),
+    labels = c("TRUE" = "\u2265 3 links", "FALSE" = "< 3 links"),
+    name = NULL
+  ) +
+  labs(x = "Year", y = "Number of links", title = "Realized links per pond-year") +
+  theme_pub()
+
+fig_links_per_pond_year
+```
+- heat map shows list of ponds that have an eligible (>= 2 distinct host-parasite interactions) change between years
+- plenty of long blue lines (implies decent continuity) while also visually depicting sampling differences
+
+- most pond-years have high + variable number of links
+- fluctuation in observed links likely reflects environmental changes (peak at 2017, gradual collapse by 2020, subsequent revival)
+
+to do: graphic that visualizes sampling flow 
+
+
+### 3. Quantifying Uncertainty
+
+```{r}
+# STAGE H3-3: quantify uncertainty in turnover vs. rewiring
+
+# reusable pond-cluster bootstrap (Cameron, Gelbach & Miller 2008) -
+# resamples unique site_code values with replacement; works identically
+# whether df has many rows per pond (transitions) or one row per pond
+# (equal-weight version), since it just rebinds whatever rows match
+bootstrap_pond_stat <- function(df, stat_fun, n_boot = 2000) {
+  site_list <- unique(df$site_code)
+  map_dfr(seq_len(n_boot), function(b) {
+    boot_sites <- sample(site_list, replace = TRUE)
+    boot_df <- map_dfr(boot_sites, function(s) df %>% filter(site_code == s)) %>%
+      mutate(boot_cluster_id = paste(site_code, b, row_number(), sep = "_"))
+    stat_fun(boot_df) %>% mutate(boot_id = b, .before = 1)
+  })
+}
+
+stat_difference <- function(df) {
+  tibble(
+    mean_difference = mean(df$beta_st - df$beta_os, na.rm = TRUE),
+    median_difference = median(df$beta_st - df$beta_os, na.rm = TRUE),
+    proportion_turnover_exceeds = mean(df$beta_st > df$beta_os, na.rm = TRUE)
+  )
+}
+
+analysis_transitions <- primary_transitions
+
+# observed statistic is the reported estimate; the bootstrap supplies CIs only
+observed_stats <- analysis_transitions %>%
+  summarize(
+    n_transitions = n(),
+    n_ponds = n_distinct(site_code),
+    estimate = mean(beta_st - beta_os, na.rm = TRUE),
+    median_difference = median(beta_st - beta_os, na.rm = TRUE),
+    iqr_difference = IQR(beta_st - beta_os, na.rm = TRUE),
+    proportion_turnover_exceeds = mean(beta_st > beta_os, na.rm = TRUE)
+  )
+
+observed_stats
+
+set.seed(6262026)
+#boot_difference <- bootstrap_pond_stat(analysis_transitions, stat_difference, n_boot = 2000)
+
+boot_ci <- boot_difference %>%
+  summarize(
+    mean_diff_lower = quantile(mean_difference, 0.025),
+    mean_diff_upper = quantile(mean_difference, 0.975),
+    prop_turnover_exceeds_lower = quantile(proportion_turnover_exceeds, 0.025),
+    prop_turnover_exceeds_upper = quantile(proportion_turnover_exceeds, 0.975)
+  )
+
+# report: observed estimate + bootstrap CI (Efron & Tibshirani 1993)
+bind_cols(observed_stats, boot_ci)
+
+# equal-pond-weight sensitivity - each pond contributes once, regardless
+# of how many transitions it has
+pond_level_difference <- analysis_transitions %>%
+  mutate(difference = beta_st - beta_os) %>%
+  group_by(site_code) %>%
+  summarize(mean_difference = mean(difference, na.rm = TRUE), .groups = "drop")
+
+set.seed(6262026)
+boot_pond_level <- bootstrap_pond_stat(
+  pond_level_difference,
+  function(df) tibble(mean_difference = mean(df$mean_difference, na.rm = TRUE)),
+  n_boot = 2000
+)
+
+tibble(
+  weighting = c("transition-weighted", "equal-pond-weight"),
+  estimate = c(observed_stats$estimate, mean(pond_level_difference$mean_difference)),
+  lower = c(quantile(boot_difference$mean_difference, 0.025), quantile(boot_pond_level$mean_difference, 0.025)),
+  upper = c(quantile(boot_difference$mean_difference, 0.975), quantile(boot_pond_level$mean_difference, 0.975))
+)
+
+# secondary cross-check only: boundary values (dissimilarity == 0 or 1)
+# are dropped here, and those are real, interpretable transitions (e.g.
+# complete rewiring or complete stasis) - the paired bootstrap above,
+# which keeps every transition, is the primary result for the manuscript
+long_transitions <- analysis_transitions %>%
+  select(site_code, year_from, year_to, beta_os, beta_st) %>%
+  mutate(transition = paste(site_code, year_from, year_to, sep = "_")) %>%
+  pivot_longer(cols = c(beta_os, beta_st), names_to = "component", values_to = "dissimilarity")
+
+n_boundary <- sum(long_transitions$dissimilarity %in% c(0, 1))
+n_boundary  # report this alongside the model - it's the count being discarded
+
+m_turnover_rewiring <- glmmTMB(
+  dissimilarity ~ component + (1 | site_code) + (1 | transition),
+  family = beta_family(),
+  data = long_transitions %>% filter(dissimilarity > 0, dissimilarity < 1)
+)
+
+summary(m_turnover_rewiring)
+
+boot_summary_vals <- boot_difference %>%
+  summarize(
+    estimate = mean(mean_difference),
+    lower = quantile(mean_difference, 0.025),
+    upper = quantile(mean_difference, 0.975)
+  )
+
+fig_bootstrap_dist <- ggplot(boot_difference, aes(x = mean_difference)) +
+  geom_histogram(bins = 40, fill = col_st, alpha = 0.7, color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+  geom_vline(data = boot_summary_vals, aes(xintercept = estimate), linewidth = 0.8) +
+  geom_vline(data = boot_summary_vals, aes(xintercept = lower), linetype = "dotted") +
+  geom_vline(data = boot_summary_vals, aes(xintercept = upper), linetype = "dotted") +
+  labs(
+    x = expression(paste("Bootstrapped mean ", beta[ST] - beta[OS])),
+    y = "Bootstrap replicates",
+    title = "Turnover exceeds rewiring across pond-resampled bootstraps",
+    subtitle = paste0(
+      "Estimate = ", round(boot_summary_vals$estimate, 2),
+      " [", round(boot_summary_vals$lower, 2), ", ", round(boot_summary_vals$upper, 2), "]"
+    )
+  ) +
+  theme_pub()
+
+fig_bootstrap_dist
+
+fig_os_vs_st <- ggplot(analysis_transitions, aes(x = beta_os, y = beta_st)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 2, alpha = 0.7, color = col_os) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    x = expression(beta[OS] ~ "(rewiring)"),
+    y = expression(beta[ST] ~ "(turnover)"),
+    title = "Turnover vs. rewiring, per pond-year transition",
+    subtitle = "Points above the diagonal: turnover exceeds rewiring"
+  ) +
+  theme_pub()
+
+fig_os_vs_st
+
+bootstrap_effect_plot <- boot_summary_vals |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = 1,
+      y = estimate
+    )
+  ) +
+  ggplot2::geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  ggplot2::geom_pointrange(
+    ggplot2::aes(
+      ymin = lower,
+      ymax = upper
+    ),
+    linewidth = 0.8
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = NULL
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = expression(
+      mean(beta[ST] - beta[OS])
+    ),
+    title = "Turnover exceeds rewiring",
+    subtitle = "Pond-resampled 95% bootstrap interval"
+  ) +
+  theme_pub()
+```
+
+- calculated differences between turnover (beta_st, network dissimilarity associated with taxa not shared between years) and rewiring (beta_os, interaction change among shared taxa)
+- performed cluster bootstrap (sample w/ replacement, all of its eligible transitions are included with a pond)
+
+- confidence interval definitively shows that average change in networks over time is associated more with turnover than rewiring 
+- suggests that changes in the network occur mostly through entry/exit of hosts and parasites, rather than switching partners
+- scatter plot shows difference between turnover/rewiring among all pond-years (generally more turnover than rewiring)
+- concentration of rewiring at relatively low values suggests that persistent taxa often retain many of their previously observed interactions
+
+to do: 
+- report # of ponds/transitions 
+- current mean weights ponds in proportion to how many transitions they contribute; add a second estimate where each pond contributes its mean difference once
+- make sure the bootstrap was done correctly
+- directly calculating/reporting the difference between turnover/rewiring for each pond-year transition might be easier
+- investigate rewiring data points (below line, site-year)
+
+### 4. Effort sensitivity
+```{r}
+# STAGE H3-4: does the turnover > rewiring ordering survive different
+# minimum-effort cutoffs, and does effort imbalance drive the beta values
+# directly? (motivated by Fründ, McCann & Williams 2016, "Sampling bias is
+# a challenge for quantifying species interaction networks", Oikos, 125(4), 502-513)
+
+# thresholds now get a real pond-bootstrap CI each, not sd()/sqrt(n()) -
+# the naive SE treats same-pond transitions as independent, which
+# contradicts the clustering assumption in Part 3
+effort_thresholds <- tibble(
+  min_links = c(3, 5, 3, 5),
+  min_hosts_dissected = c(0, 0, 10, 10)
+)
+
+threshold_results <- pmap(
+  effort_thresholds,
+  function(min_links, min_hosts_dissected) {
+    df <- build_within_site_transitions(
+      hp_edges_beta, network_effort,
+      min_links = min_links, min_hosts_dissected = min_hosts_dissected
+    ) %>% filter(is_adjacent_year, eligible)
+
+    set.seed(6262026)
+    boot <- bootstrap_pond_stat(df, stat_difference, n_boot = 2000)
+
+    tibble(
+      min_links_threshold = min_links,
+      min_hosts_threshold = min_hosts_dissected,
+      n_transitions = nrow(df),
+      n_ponds = n_distinct(df$site_code),
+      estimate = mean(df$beta_st - df$beta_os, na.rm = TRUE),
+      lower = quantile(boot$mean_difference, 0.025),
+      upper = quantile(boot$mean_difference, 0.975)
+    )
+  }
+)
+
+threshold_summary <- bind_rows(threshold_results)
+threshold_summary
+
+# why hosts>=0 and hosts>=10 give identical n: report the actual floor
+baseline_transitions %>%
+  filter(is_adjacent_year, links_ok, shared_hosts_ok, shared_parasites_ok) %>%
+  summarize(min_effort_among_link_eligible = min(pmin(effort_from, effort_to), na.rm = TRUE))
+# if that minimum is already >= 10, the two thresholds were never going
+# to differ - not a bug in the threshold code
+
+fig_threshold_sensitivity <- transitions_by_threshold %>%
+  filter(is_adjacent_year, eligible) %>%
+  group_by(min_links_threshold, min_hosts_threshold) %>%
+  summarize(
+    n_transitions = n(),
+    estimate = mean(beta_st - beta_os, na.rm = TRUE),
+    se = sd(beta_st - beta_os, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(threshold_label = paste0("links\u2265", min_links_threshold, ", hosts\u2265", min_hosts_threshold)) %>%
+  ggplot(aes(x = threshold_label, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_pointrange(aes(ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), color = col_st) +
+  geom_text(aes(label = paste0("n=", n_transitions)), vjust = -1.4, size = 3) +
+  labs(
+    x = "Minimum-effort threshold",
+    y = expression(paste("Mean ", beta[ST] - beta[OS])),
+    title = "Turnover-rewiring difference is stable across effort thresholds"
+  ) +
+  theme_pub() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+fig_threshold_sensitivity
+
+fig_effort_correlation <- baseline_transitions %>%
+  filter(is_adjacent_year, eligible) %>%
+  mutate(effort_diff = abs(effort_to - effort_from)) %>%
+  select(effort_diff, beta_wn, beta_os, beta_st) %>%
+  pivot_longer(cols = c(beta_wn, beta_os, beta_st), names_to = "component", values_to = "value") %>%
+  mutate(component = recode(component, beta_wn = "\u03b2[WN]", beta_os = "\u03b2[OS]", beta_st = "\u03b2[ST]")) %>%
+  ggplot(aes(x = effort_diff, y = value)) +
+  geom_point(alpha = 0.6, color = col_os) +
+  geom_smooth(method = "lm", se = TRUE, color = "grey30", linewidth = 0.6) +
+  facet_wrap(~component, labeller = label_parsed) +
+  labs(
+    x = "Difference in dissected hosts between years",
+    y = "Dissimilarity component",
+    title = "Network dissimilarity vs. sampling-effort imbalance"
+  ) +
+  theme_pub()
+
+fig_effort_correlation
+
+
+
+# effort-balance restrictions + a relative (log-ratio) imbalance measure -
+# a 30-dissection gap means something different for 10 vs 40 than for
+# 200 vs 230 (log-ratio framing follows the response-ratio convention in
+# Hedges, Gurevitch & Curtis 1999, "The meta-analysis of response ratios
+# in experimental ecology", Ecology, 80(4), 1150-1156)
+effort_transitions <- baseline_transitions %>%
+  filter(is_adjacent_year, eligible) %>%
+  mutate(
+    mean_effort = (effort_from + effort_to) / 2,
+    effort_diff = abs(effort_to - effort_from),
+    effort_log_ratio = abs(log1p(effort_to) - log1p(effort_from))
+  )
+
+balance_thresholds <- c(100, 50, 25)
+
+balance_results <- map(balance_thresholds, function(thresh) {
+  df <- effort_transitions %>% filter(effort_diff <= thresh)
+
+  set.seed(6262026)
+  boot <- bootstrap_pond_stat(df, stat_difference, n_boot = 2000)
+
+  tibble(
+    max_effort_diff = thresh,
+    n_transitions = nrow(df),
+    n_ponds = n_distinct(df$site_code),
+    estimate = mean(df$beta_st - df$beta_os, na.rm = TRUE),
+    lower = quantile(boot$mean_difference, 0.025),
+    upper = quantile(boot$mean_difference, 0.975)
+  )
+})
+
+bind_rows(balance_results)
+
+# absolute diff and log-ratio, examined together with overall sampling
+# intensity - descriptive correlations only, not causal
+effort_transitions %>%
+  summarize(
+    cor_wn_diff = cor(beta_wn, effort_diff, use = "pairwise.complete.obs"),
+    cor_wn_logratio = cor(beta_wn, effort_log_ratio, use = "pairwise.complete.obs"),
+    cor_wn_mean_effort = cor(beta_wn, mean_effort, use = "pairwise.complete.obs")
+  )
+
+# formal alternative to a geom_smooth(method = "lm") line - pond random
+# effect follows standard GLMM practice in ecology (Bolker et al. 2009,
+# "Generalized linear mixed models: a practical guide for ecology and
+# evolution", Trends in Ecology & Evolution, 24(3), 127-135)
+m_effort_diff_slope <- glmmTMB(
+  beta_wn ~ scale(effort_diff) + (1 | site_code),
+  data = effort_transitions
+)
+
+summary(m_effort_diff_slope)
+```
+
+- reruns transition-building process under four thresholds with varying sampling cutoffs; calculates the same metrics as above
+- no difference among thresholds; suggests the central turnover-dominance result isn't being skewed by very small networks
+
+- for some reason, rewiring has no association with sampling effort imbalance (might indicate that positive turnover signal may reflect unequal detection between years vs any biological reason)
+- however, rewiring is calculated using shared taxa, so it might just be less sensitive to one year from detecting more taxa
+
+to do: run the pond-resampled bootstrap separately under each threshold (because treating transitions from the same pond as independent contradicts the cluster-bootstrapping from before)
+- use log-scale for imbalance
+- ignore lm and use a mixed model instead (pond as a random effect)
+- try rarefaction (ID less-sampled year for each transition, subsample the more heavily sampled year and rebuild networks/transitions/betas and repeat )
+
+
+- rinse and repeat but focus on pond-year transitions involving bullfrogs (different turnover–rewiring balance than transitions without bullfrogs?)
+
+
+- ID eco mechanisms behind rewiring/turnover (predict turnover using pond characteristics?)
+
+```{r}
+# detectability check via individual-based subsampling (rarefaction),
+# following the logic in Gotelli & Colwell 2001 ("Quantifying
+# biodiversity: procedures and pitfalls in the measurement and comparison
+# of species richness", Ecology Letters, 4(4), 379-391), applied here to
+# network dissimilarity instead of richness. Rebuilds from
+# dissection-level records rather than the pre-aggregated edge table.
+# NOTE: this is the most expensive chunk here - drop n_reps for a first
+# pass, raise it for the version that goes in the manuscript.
+
+hp_binary_positive <- hp_binary %>%
+  filter(interaction == 1) %>%
+  transmute(
+    site_code = as.character(site_code),
+    year = as.integer(year),
+    dissect_code,
+    host = as.character(spp_code),
+    parasite = as.character(parasite_name)
+  ) %>%
+  filter(!is.na(host), !is.na(parasite), host != "", parasite != "")
+
+rebuild_edges_from_dissections <- function(dissect_codes, individual_data) {
+  individual_data %>% filter(dissect_code %in% dissect_codes) %>% distinct(host, parasite)
+}
+
+subsample_transition_beta <- function(target_site, target_yr_from, target_yr_to, individual_data, n_reps = 200) {
+
+  dissect_1 <- individual_data %>% filter(site_code == target_site, year == target_yr_from) %>% pull(dissect_code) %>% unique()
+  dissect_2 <- individual_data %>% filter(site_code == target_site, year == target_yr_to) %>% pull(dissect_code) %>% unique()
+
+  if (length(dissect_1) < 2 || length(dissect_2) < 2) return(tibble())
+
+  target_n <- min(length(dissect_1), length(dissect_2))
+
+  map_dfr(seq_len(n_reps), function(r) {
+    sub_1 <- sample(dissect_1, target_n, replace = FALSE)
+    sub_2 <- sample(dissect_2, target_n, replace = FALSE)
+    e1 <- rebuild_edges_from_dissections(sub_1, individual_data)
+    e2 <- rebuild_edges_from_dissections(sub_2, individual_data)
+    network_beta(e1, e2) %>% mutate(rep = r, .before = 1)
+  }) %>%
+    mutate(site_code = target_site, year_from = target_yr_from, year_to = target_yr_to, target_n = target_n, .before = 1)
+}
+
+set.seed(6262026)
+rarefaction_results <- pmap_dfr(
+  primary_transitions %>% distinct(site_code, year_from, year_to),
+  function(site_code, year_from, year_to) {
+    subsample_transition_beta(site_code, year_from, year_to, hp_binary_positive, n_reps = 200)
+  }
+)
+
+rarefaction_summary <- rarefaction_results %>%
+  group_by(site_code, year_from, year_to, target_n) %>%
+  summarize(
+    mean_difference_rarefied = mean(beta_st - beta_os, na.rm = TRUE),
+    proportion_turnover_exceeds_rarefied = mean(beta_st > beta_os, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+rarefaction_summary %>%
+  summarize(
+    mean_difference = mean(mean_difference_rarefied, na.rm = TRUE),
+    proportion_turnover_exceeds = mean(proportion_turnover_exceeds_rarefied, na.rm = TRUE)
+  )
+```
+
+
+
+
+```{r}
+# STAGE H3-5: pond permanence as the primary predictor (already
+# established elsewhere in the workflow, so this doesn't add a new
+# untested variable), with mean sampling effort included only as a
+# methodological control - not a second ecological claim.
+
+transition_covariates <- primary_transitions %>%
+  left_join(site_info %>% select(site_code, longevity), by = "site_code") %>%
+  mutate(mean_effort = (effort_from + effort_to) / 2)
+
+m_turnover_fraction <- glmmTMB(
+  turnover_fraction ~
+    longevity +
+    scale(mean_effort) +
+    (1 | site_code),
+  family = beta_family(),
+  data = transition_covariates %>% filter(turnover_fraction > 0, turnover_fraction < 1)
+)
+
+summary(m_turnover_fraction)
+
+# run ONE of these at a time in place of longevity above if you want to
+# check a different predictor instead - not stacked together:
+# - ever_dry (join env_site_year by site_code + year_to)
+# - scale(year_gap)  [only varies once gap_transitions are included]
+
+pred_grid <- transition_covariates %>%
+  distinct(longevity) %>%
+  mutate(mean_effort = mean(transition_covariates$mean_effort, na.rm = TRUE))
+
+predict_out <- predict(
+  m_turnover_fraction, newdata = pred_grid,
+  type = "link", se.fit = TRUE, re.form = NA
+)
+
+pred_grid <- pred_grid %>%
+  mutate(
+    pred = plogis(predict_out$fit),
+    lower = plogis(predict_out$fit - 1.96 * predict_out$se.fit),
+    upper = plogis(predict_out$fit + 1.96 * predict_out$se.fit)
+  )
+
+fig_turnover_by_longevity <- ggplot(pred_grid, aes(x = longevity, y = pred)) +
+  geom_jitter(
+    data = transition_covariates,
+    aes(x = longevity, y = turnover_fraction),
+    width = 0.1, alpha = 0.25, inherit.aes = FALSE, color = "grey40"
+  ) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), color = col_st, linewidth = 0.9, size = 0.8) +
+  labs(
+    x = "Pond permanence",
+    y = expression(paste("Turnover fraction (", beta[ST], "/", beta[WN], ")")),
+    title = "Predicted turnover fraction by pond permanence",
+    subtitle = "Points: observed transitions; effort held at its mean"
+  ) +
+  theme_pub()
+
+fig_turnover_by_longevity
 ```
 
 
